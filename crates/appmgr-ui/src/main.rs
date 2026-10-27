@@ -87,6 +87,7 @@ pub enum Message {
     Loaded(Vec<InstalledApp>),
     Search(String),
     OpenDetails(String),
+    Select(String),
     CloseDetail,
     ToggleProtected,
     OpenMenu(String),
@@ -123,8 +124,10 @@ pub struct AppManager {
     apps: Vec<InstalledApp>,
     query: String,
     loading: bool,
-    /// Id of the app whose details are open.
+    /// Id of the app whose row is highlighted.
     selected: Option<String>,
+    /// Id of the app whose details panel is open.
+    detail: Option<String>,
     /// Whether locked system apps are listed.
     show_protected: bool,
     /// Id of the app whose three-dot menu is open.
@@ -171,6 +174,7 @@ impl Application for AppManager {
                 query: String::new(),
                 loading: true,
                 selected: None,
+                detail: None,
                 show_protected: true,
                 menu: None,
                 dialog: None,
@@ -190,6 +194,7 @@ impl Application for AppManager {
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
         self.nav_model.activate(id);
         self.selected = None;
+        self.detail = None;
         self.menu = None;
         Task::none()
     }
@@ -199,6 +204,7 @@ impl Application for AppManager {
             Message::Refresh => {
                 self.loading = true;
                 self.selected = None;
+                self.detail = None;
                 self.menu = None;
                 load_inventory()
             }
@@ -207,6 +213,9 @@ impl Application for AppManager {
                 self.loading = false;
                 if self.selected_app().is_none() {
                     self.selected = None;
+                }
+                if self.detail_app().is_none() {
+                    self.detail = None;
                 }
                 Task::none()
             }
@@ -224,11 +233,16 @@ impl Application for AppManager {
             }
             Message::OpenDetails(id) => {
                 self.menu = None;
+                self.selected = Some(id.clone());
+                self.detail = Some(id);
+                Task::none()
+            }
+            Message::Select(id) => {
                 self.selected = Some(id);
                 Task::none()
             }
             Message::CloseDetail => {
-                self.selected = None;
+                self.detail = None;
                 Task::none()
             }
             Message::ToggleProtected => {
@@ -412,6 +426,9 @@ impl Application for AppManager {
                     if self.selected.as_deref() == Some(app.id.as_str()) {
                         self.selected = None;
                     }
+                    if self.detail.as_deref() == Some(app.id.as_str()) {
+                        self.detail = None;
+                    }
                     self.loading = true;
                     load_inventory()
                 }
@@ -447,7 +464,7 @@ impl Application for AppManager {
         }
 
         let body = self.body(page);
-        if let Some(app) = self.selected_app() {
+        if let Some(app) = self.detail_app() {
             content = content.push(
                 widget::row![body, self.detail(app)]
                     .spacing(16)
@@ -475,6 +492,11 @@ impl AppManager {
 
     fn selected_app(&self) -> Option<&InstalledApp> {
         let id = self.selected.as_deref()?;
+        self.apps.iter().find(|app| app.id == id)
+    }
+
+    fn detail_app(&self) -> Option<&InstalledApp> {
+        let id = self.detail.as_deref()?;
         self.apps.iter().find(|app| app.id == id)
     }
 
@@ -988,10 +1010,17 @@ fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'stat
         row = row.push(widget::icon::from_name("changes-prevent-symbolic").size(16));
     }
 
-    let menu_button: Element<'static, Message> =
-        button::icon(widget::icon::from_name("open-menu-symbolic").size(16))
-            .on_press(Message::OpenMenu(app.id.clone()))
-            .into();
+    let menu_icon = button::icon(widget::icon::from_name("open-menu-symbolic").size(16))
+        .on_press(Message::OpenMenu(app.id.clone()));
+    let menu_button: Element<'static, Message> = if menu_open {
+        widget::popover(menu_icon)
+            .popup(menu_popup(app))
+            .position(widget::popover::Position::Bottom)
+            .on_close(Message::CloseMenu)
+            .into()
+    } else {
+        menu_icon.into()
+    };
     row = row.push(menu_button);
 
     let style = if selected {
@@ -1018,15 +1047,9 @@ fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'stat
         .class(style)
         .into();
 
-    if menu_open {
-        widget::popover(row)
-            .popup(menu_popup(app))
-            .position(widget::popover::Position::Bottom)
-            .on_close(Message::CloseMenu)
-            .into()
-    } else {
-        row
-    }
+    widget::mouse_area(row)
+        .on_press(Message::Select(app.id.clone()))
+        .into()
 }
 
 fn menu_popup(app: &InstalledApp) -> Element<'static, Message> {
