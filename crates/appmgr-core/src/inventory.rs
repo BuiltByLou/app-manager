@@ -5,7 +5,7 @@ use crate::desktop::DesktopEntry;
 use crate::dpkg::InstalledPackage;
 use crate::flatpak::FlatpakApp;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Apt,
     Flatpak,

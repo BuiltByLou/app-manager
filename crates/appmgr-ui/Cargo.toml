@@ -1,0 +1,10 @@
+[package]
+name = "appmgr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gestor de apps para Linux"
+
+[dependencies]
+appmgr-core = { path = "../appmgr-core" }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["winit", "wayland", "x11", "tokio"] }

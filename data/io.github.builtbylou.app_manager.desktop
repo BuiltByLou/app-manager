@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=App Manager
+Comment=Ver, atualizar e remover apps instaladas
+Exec=appmgr
+Icon=io.github.builtbylou.app_manager
+Terminal=false
+Type=Application
+Categories=System;PackageManager;
+Keywords=apps;uninstall;update;flatpak;deb;appimage;
