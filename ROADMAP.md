@@ -18,7 +18,7 @@
 | Fase | Nome | Estado |
 |------|------|--------|
 | 0 | Fundação: inventário read-only | Concluída (inventário em 266 ms, interface em inglês) |
-| 1 | Remoção segura | Em curso (pré-visualização real com `apt-get -s` e execução escrita; falta confirmar num desktop com agente polkit) |
+| 1 | Remoção segura | Em curso (pré-visualização real, execução via sudo, deteção de vestígios e histórico) |
 | 2 | Instalação a partir do GitHub | Por começar |
 | 3 | Atualizações | Por começar |
 | 4 | Publicação | Por começar |
@@ -167,3 +167,4 @@ A fase 0 é obrigatória para tudo. A fase 1 não depende da 2; a 2 não depende
 | 2026-10-27 | Fase 1 (D9): linhas selecionáveis, painel de detalhe e pré-visualização de remoção com `apt-get -s`; bibliotecas partilhadas e órfãs ficam instaladas. Nada é executado. | 1 |
 | 2026-10-27 | Fase 1 (D10): apps protegidas passaram para o fundo do separador Sistema, com botão *Show locked / Hide locked* e contagem. | 1 |
 | 2026-10-27 | Fase 1 (D11): menu de três pontos em cada linha com *Details* e *Remove*; *Remove* abre um diálogo de confirmação com o plano real e executa só depois de confirmar (`pkexec` para apt/Flatpak de sistema, `gio trash` para AppImage). | 1 |
+| 2026-10-27 | Fase 1: deteção de vestígios em ~/.config, ~/.local/share, ~/.cache, systemd user, integração AppImage e dados Flatpak, com envio para o lixo; histórico de remoções em ~/.local/share/app-manager/history.log. | 1 |
