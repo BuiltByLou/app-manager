@@ -1,4 +1,5 @@
 mod i18n;
+mod prefs;
 mod view_model;
 
 use cosmic::app::{Core, Settings, Task};
@@ -8,7 +9,10 @@ use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
 use appmgr_core::real::RealProbe;
-use appmgr_core::removal::{RemovalPlan, plan_for, removal_command, run_removal};
+use appmgr_core::removal::{
+    RemovalPlan, authorize, is_authorized, keep_sudo_alive, plan_for, removal_command, run_removal,
+};
+use prefs::Preferences;
 use view_model::{Group, GroupKind, apps_for, filter, format_size, system_groups};
 
 const APP_ID: &str = "io.github.builtbylou.app_manager";
@@ -45,17 +49,36 @@ impl Page {
     }
 }
 
-/// Where a removal is in its life cycle. The dialog follows this.
-enum Stage {
-    Planning,
-    Ready(RemovalPlan),
+/// The modal currently on screen, if any.
+enum Dialog {
+    /// Asks for the administrator password once for the whole session.
+    Auth {
+        pending: Option<InstalledApp>,
+        checking: bool,
+        error: Option<String>,
+    },
+    /// One-sentence confirmation from the three-dot menu.
+    QuickConfirm {
+        app: InstalledApp,
+        dont_ask: bool,
+    },
+    /// Asks apt whether anything else would go, behind a quick removal.
+    QuickCheck {
+        app: InstalledApp,
+    },
+    /// Computes the full plan for a removal started from the details panel.
+    Planning {
+        app: InstalledApp,
+    },
+    /// Full plan with packages, dependents and kept libraries.
+    Plan {
+        app: InstalledApp,
+        plan: RemovalPlan,
+    },
     Running,
-    Failed(String),
-}
-
-struct RemovalState {
-    app: InstalledApp,
-    stage: Stage,
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -63,17 +86,35 @@ pub enum Message {
     Refresh,
     Loaded(Vec<InstalledApp>),
     Search(String),
-    Select(String),
+    OpenDetails(String),
     CloseDetail,
     ToggleProtected,
     OpenMenu(String),
     CloseMenu,
-    OpenDetails(String),
-    StartRemoval(String),
-    Planned(RemovalPlan),
-    ConfirmRemoval,
-    CancelRemoval,
-    Removed(Result<(), String>),
+    StartQuickRemoval(String),
+    StartDetailedRemoval(String),
+    ToggleDontAsk(bool),
+    ConfirmQuick,
+    CancelDialog,
+    QuickChecked {
+        id: String,
+        plan: RemovalPlan,
+    },
+    PlanReady {
+        id: String,
+        plan: RemovalPlan,
+    },
+    ConfirmPlan,
+    AuthChecked(bool),
+    PasswordChanged(String),
+    SubmitPassword,
+    AuthResult(Result<(), String>),
+    SkipAuth,
+    Removed {
+        app: InstalledApp,
+        result: Result<(), String>,
+    },
+    SetConfirmRemovals(bool),
 }
 
 pub struct AppManager {
@@ -88,8 +129,13 @@ pub struct AppManager {
     show_protected: bool,
     /// Id of the app whose three-dot menu is open.
     menu: Option<String>,
-    /// The removal in progress, shown in the dialog.
-    removal: Option<RemovalState>,
+    dialog: Option<Dialog>,
+    /// Sudo already holds an authorization for this session.
+    authorized: bool,
+    keepalive_started: bool,
+    password: String,
+    /// Persisted: ask before a quick removal.
+    confirm_removals: bool,
 }
 
 impl Application for AppManager {
@@ -127,9 +173,13 @@ impl Application for AppManager {
                 selected: None,
                 show_protected: true,
                 menu: None,
-                removal: None,
+                dialog: None,
+                authorized: false,
+                keepalive_started: false,
+                password: String::new(),
+                confirm_removals: Preferences::load().confirm_removals,
             },
-            load_inventory(),
+            Task::batch([load_inventory(), check_auth()]),
         )
     }
 
@@ -172,7 +222,7 @@ impl Application for AppManager {
                 }
                 Task::none()
             }
-            Message::Select(id) => {
+            Message::OpenDetails(id) => {
                 self.menu = None;
                 self.selected = Some(id);
                 Task::none()
@@ -199,52 +249,192 @@ impl Application for AppManager {
                 self.menu = None;
                 Task::none()
             }
-            Message::OpenDetails(id) => {
+            Message::StartQuickRemoval(id) => {
                 self.menu = None;
-                self.selected = Some(id);
-                Task::none()
-            }
-            Message::StartRemoval(id) => self.begin_removal(id),
-            Message::Planned(plan) => {
-                if let Some(state) = &mut self.removal
-                    && matches!(state.stage, Stage::Planning)
-                {
-                    state.stage = Stage::Ready(plan);
-                }
-                Task::none()
-            }
-            Message::ConfirmRemoval => {
-                let Some(state) = &self.removal else {
+                let Some(app) = self.removable_app(&id) else {
                     return Task::none();
                 };
-                if !matches!(state.stage, Stage::Ready(_)) {
-                    return Task::none();
+                if self.confirm_removals {
+                    self.dialog = Some(Dialog::QuickConfirm { app, dont_ask: false });
+                    Task::none()
+                } else {
+                    self.begin_quick_check(app)
                 }
-                let app = state.app.clone();
-                if let Some(state) = &mut self.removal {
-                    state.stage = Stage::Running;
-                }
-                remove_app(app)
             }
-            Message::CancelRemoval => {
-                self.removal = None;
+            Message::StartDetailedRemoval(id) => {
+                self.menu = None;
+                let Some(app) = self.removable_app(&id) else {
+                    return Task::none();
+                };
+                self.selected = Some(app.id.clone());
+                self.dialog = Some(Dialog::Planning { app: app.clone() });
+                detailed_plan(app)
+            }
+            Message::ToggleDontAsk(dont_ask) => {
+                if let Some(Dialog::QuickConfirm {
+                    dont_ask: current, ..
+                }) = &mut self.dialog
+                {
+                    *current = dont_ask;
+                }
                 Task::none()
             }
-            Message::Removed(result) => match result {
+            Message::ConfirmQuick => {
+                let Some(Dialog::QuickConfirm { app, dont_ask }) = self.dialog.take() else {
+                    return Task::none();
+                };
+                if dont_ask {
+                    self.set_confirm_removals(false);
+                }
+                self.begin_quick_check(app)
+            }
+            Message::CancelDialog => {
+                self.close_dialog();
+                Task::none()
+            }
+            Message::QuickChecked { id, plan } => {
+                let Some(Dialog::QuickCheck { app }) = self.dialog.take() else {
+                    return Task::none();
+                };
+                if app.id != id {
+                    self.dialog = Some(Dialog::QuickCheck { app });
+                    return Task::none();
+                }
+                if plan.error.is_some() || !plan.extra_packages.is_empty() {
+                    // Safer path: show what else would go before running it.
+                    self.dialog = Some(Dialog::Plan { app, plan });
+                    Task::none()
+                } else {
+                    self.execute(app)
+                }
+            }
+            Message::PlanReady { id, plan } => {
+                if let Some(Dialog::Planning { app }) = self.dialog.take() {
+                    if app.id == id {
+                        self.dialog = Some(Dialog::Plan { app, plan });
+                    } else {
+                        self.dialog = Some(Dialog::Planning { app });
+                    }
+                }
+                Task::none()
+            }
+            Message::ConfirmPlan => {
+                let Some(Dialog::Plan { app, .. }) = self.dialog.take() else {
+                    return Task::none();
+                };
+                self.execute(app)
+            }
+            Message::AuthChecked(authorized) => {
+                self.authorized = authorized;
+                if authorized {
+                    self.start_keepalive();
+                    if matches!(
+                        self.dialog,
+                        Some(Dialog::Auth {
+                            pending: None,
+                            ..
+                        })
+                    ) {
+                        self.dialog = None;
+                    }
+                } else if self.dialog.is_none() {
+                    self.dialog = Some(Dialog::Auth {
+                        pending: None,
+                        checking: false,
+                        error: None,
+                    });
+                }
+                Task::none()
+            }
+            Message::PasswordChanged(password) => {
+                self.password = password;
+                if let Some(Dialog::Auth { error, .. }) = &mut self.dialog {
+                    *error = None;
+                }
+                Task::none()
+            }
+            Message::SubmitPassword => {
+                if let Some(Dialog::Auth { checking, error, .. }) = &mut self.dialog {
+                    *checking = true;
+                    *error = None;
+                } else {
+                    return Task::none();
+                }
+                let password = std::mem::take(&mut self.password);
+                Task::perform(
+                    async move {
+                        let result = authorize(&password);
+                        wipe(password);
+                        result
+                    },
+                    |result| cosmic::Action::App(Message::AuthResult(result)),
+                )
+            }
+            Message::AuthResult(result) => match result {
                 Ok(()) => {
-                    self.removal = None;
-                    self.selected = None;
-                    self.menu = None;
-                    self.loading = true;
-                    load_inventory()
+                    self.authorized = true;
+                    self.start_keepalive();
+                    let pending = match self.dialog.take() {
+                        Some(Dialog::Auth { pending, .. }) => pending,
+                        other => {
+                            self.dialog = other;
+                            None
+                        }
+                    };
+                    if let Some(app) = pending {
+                        self.execute(app)
+                    } else {
+                        Task::none()
+                    }
                 }
                 Err(error) => {
-                    if let Some(state) = &mut self.removal {
-                        state.stage = Stage::Failed(error);
+                    eprintln!("appmgr: administrator authorization failed: {error}");
+                    if let Some(Dialog::Auth {
+                        checking, error: shown,
+                        ..
+                    }) = &mut self.dialog
+                    {
+                        *checking = false;
+                        *shown = Some(fl!("auth-failed"));
                     }
                     Task::none()
                 }
             },
+            Message::SkipAuth => {
+                self.close_dialog();
+                Task::none()
+            }
+            Message::Removed { app, result } => match result {
+                Ok(()) => {
+                    if matches!(self.dialog, Some(Dialog::Running)) {
+                        self.dialog = None;
+                    }
+                    if self.selected.as_deref() == Some(app.id.as_str()) {
+                        self.selected = None;
+                    }
+                    self.loading = true;
+                    load_inventory()
+                }
+                Err(error) => {
+                    if needs_password(&error) {
+                        self.authorized = false;
+                        if matches!(self.dialog, Some(Dialog::Running) | None) {
+                            self.dialog = Some(Dialog::Auth {
+                                pending: Some(app),
+                                checking: false,
+                                error: None,
+                            });
+                        }
+                    } else if matches!(self.dialog, Some(Dialog::Running)) {
+                        self.dialog = Some(Dialog::Failed { error });
+                    }
+                    Task::none()
+                }
+            },
+            Message::SetConfirmRemovals(confirm) => {
+                self.set_confirm_removals(confirm);
+                Task::none()
+            }
         }
     }
 
@@ -286,6 +476,65 @@ impl AppManager {
     fn selected_app(&self) -> Option<&InstalledApp> {
         let id = self.selected.as_deref()?;
         self.apps.iter().find(|app| app.id == id)
+    }
+
+    fn removable_app(&self, id: &str) -> Option<InstalledApp> {
+        self.apps
+            .iter()
+            .find(|app| app.id == id && !app.protected)
+            .cloned()
+    }
+
+    fn set_confirm_removals(&mut self, confirm: bool) {
+        self.confirm_removals = confirm;
+        Preferences {
+            confirm_removals: confirm,
+        }
+        .save();
+    }
+
+    fn close_dialog(&mut self) {
+        if matches!(self.dialog, Some(Dialog::Auth { .. })) {
+            wipe(std::mem::take(&mut self.password));
+        }
+        self.dialog = None;
+    }
+
+    fn start_keepalive(&mut self) {
+        if !self.keepalive_started {
+            self.keepalive_started = true;
+            keep_sudo_alive();
+        }
+    }
+
+    /// Checks apt for a quick removal. If it would take other packages with
+    /// it, the user sees the full plan before anything runs.
+    fn begin_quick_check(&mut self, app: InstalledApp) -> Task<Message> {
+        self.dialog = Some(Dialog::QuickCheck { app: app.clone() });
+        quick_check(app)
+    }
+
+    /// Runs the removal, asking for the administrator password first if it
+    /// is needed and not authorized yet.
+    fn execute(&mut self, app: InstalledApp) -> Task<Message> {
+        match removal_command(&app) {
+            Err(error) => {
+                self.dialog = Some(Dialog::Failed { error });
+                Task::none()
+            }
+            Ok(command) if command.needs_permission() && !self.authorized => {
+                self.dialog = Some(Dialog::Auth {
+                    pending: Some(app),
+                    checking: false,
+                    error: None,
+                });
+                Task::none()
+            }
+            Ok(_) => {
+                self.dialog = Some(Dialog::Running);
+                remove_app(app)
+            }
+        }
     }
 
     fn search_row(&self) -> Element<'_, Message> {
@@ -406,131 +655,98 @@ impl AppManager {
         }
     }
 
-    /// Starts a removal: asks the system what it would do, then shows the
-    /// dialog. Nothing is removed until the user confirms.
-    fn begin_removal(&mut self, id: String) -> Task<Message> {
-        let Some(app) = self
-            .apps
-            .iter()
-            .find(|app| app.id == id && !app.protected)
-            .cloned()
-        else {
-            return Task::none();
-        };
-
-        self.menu = None;
-        self.removal = Some(RemovalState {
-            app: app.clone(),
-            stage: Stage::Planning,
-        });
-
-        Task::perform(
-            async move {
-                let probe = RealProbe::new();
-                plan_for(&app, |package| probe.simulate_apt_remove(package))
-            },
-            |plan| cosmic::Action::App(Message::Planned(plan)),
-        )
-    }
-
     fn removal_dialog(&self) -> Option<Element<'_, Message>> {
-        let state = self.removal.as_ref()?;
-        let app = &state.app;
-        let mut dialog = widget::dialog::dialog()
+        let dialog = self.dialog.as_ref()?;
+        let mut window = widget::dialog::dialog()
             .title(fl!("remove-title"))
             .max_width(520.0);
 
-        match &state.stage {
-            Stage::Planning => {
-                dialog = dialog.body(fl!("remove-planning")).secondary_action(
-                    button::standard(fl!("remove-cancel")).on_press(Message::CancelRemoval),
+        match dialog {
+            Dialog::Auth {
+                pending,
+                checking,
+                error,
+            } => {
+                let body = if pending.is_some() {
+                    fl!("auth-body-remove")
+                } else {
+                    fl!("auth-body")
+                };
+                let input: Element<'_, Message> =
+                    widget::secure_input(fl!("auth-placeholder"), &self.password, None, true)
+                        .on_input(Message::PasswordChanged)
+                        .on_submit(|_| Message::SubmitPassword)
+                        .into();
+                window = window
+                    .title(fl!("auth-title"))
+                    .body(body)
+                    .control(input);
+                if let Some(error) = error {
+                    window = window.control(text::caption(error.clone()));
+                }
+                if *checking {
+                    window = window.control(text::caption(fl!("auth-checking")));
+                } else {
+                    window = window
+                        .primary_action(
+                            button::suggested(fl!("auth-continue"))
+                                .on_press(Message::SubmitPassword),
+                        )
+                        .secondary_action(
+                            button::standard(fl!("auth-skip")).on_press(Message::SkipAuth),
+                        );
+                }
+            }
+            Dialog::QuickConfirm { app, dont_ask } => {
+                let dont_ask: Element<'_, Message> =
+                    widget::checkbox(*dont_ask)
+                        .label(fl!("remove-dont-ask"))
+                        .on_toggle(Message::ToggleDontAsk)
+                        .into();
+                window = window
+                    .body(fl!("remove-quick-body", name = app.name.clone()))
+                    .control(dont_ask)
+                    .primary_action(
+                        button::destructive(fl!("remove-confirm"))
+                            .on_press(Message::ConfirmQuick),
+                    )
+                    .secondary_action(
+                        button::standard(fl!("remove-cancel"))
+                            .on_press(Message::CancelDialog),
+                    );
+            }
+            Dialog::QuickCheck { .. } => {
+                window = window.body(fl!("remove-checking")).secondary_action(
+                    button::standard(fl!("remove-cancel")).on_press(Message::CancelDialog),
                 );
             }
-            Stage::Running => {
-                dialog = dialog
+            Dialog::Planning { .. } => {
+                window = window.body(fl!("remove-planning")).secondary_action(
+                    button::standard(fl!("remove-cancel")).on_press(Message::CancelDialog),
+                );
+            }
+            Dialog::Plan { app, plan } => {
+                window = plan_dialog(window, app, plan);
+            }
+            Dialog::Running => {
+                window = window
                     .body(fl!("remove-running"))
                     .control(text::caption(fl!("remove-running-note")))
                     .secondary_action(
-                        button::standard(fl!("remove-running-close"))
-                            .on_press(Message::CancelRemoval),
+                        button::standard(fl!("remove-close")).on_press(Message::CancelDialog),
                     );
             }
-            Stage::Failed(error) => {
-                dialog = dialog
+            Dialog::Failed { error } => {
+                window = window
                     .body(fl!("remove-failed"))
                     .control(text::caption(error.clone()))
                     .primary_action(
-                        button::standard(fl!("remove-close"))
-                            .on_press(Message::CancelRemoval),
+                        button::standard(fl!("remove-close")).on_press(Message::CancelDialog),
                     );
-            }
-            Stage::Ready(plan) => {
-                let mut controls: Vec<Element<'_, Message>> = Vec::new();
-
-                if let Some(error) = &plan.error {
-                    dialog = dialog.body(fl!("remove-refused"));
-                    controls.push(text::caption(error.clone()).into());
-                } else {
-                    dialog = dialog.body(fl!("remove-body", name = app.name.clone()));
-                    controls.push(text::caption(fl!("remove-package")).into());
-                    controls.push(text::body(plan.target.clone()).into());
-
-                    if !plan.extra_packages.is_empty() {
-                        controls.push(text::caption(fl!("remove-extra")).into());
-                        for package in &plan.extra_packages {
-                            controls.push(text::caption(package.clone()).into());
-                        }
-                    }
-
-                    if !plan.kept_orphans.is_empty() {
-                        let count = plan.kept_orphans.len() as i64;
-                        controls.push(text::caption(fl!("remove-kept", count = count)).into());
-                    }
-
-                    match plan.origin {
-                        Origin::Apt => {
-                            controls.push(text::caption(fl!("remove-shared-libs")).into());
-                        }
-                        Origin::Flatpak => {
-                            controls.push(text::caption(fl!("remove-flatpak-note")).into());
-                        }
-                        Origin::AppImage => {
-                            controls.push(text::caption(fl!("remove-appimage-note")).into());
-                        }
-                    }
-                }
-
-                for control in controls {
-                    dialog = dialog.control(control);
-                }
-
-                dialog = match removal_command(app) {
-                    Ok(command) => {
-                        if command.needs_permission() {
-                            dialog.control(text::caption(fl!("remove-needs-permission")))
-                        } else {
-                            dialog
-                        }
-                        .primary_action(
-                            button::destructive(fl!("remove-confirm"))
-                                .on_press(Message::ConfirmRemoval),
-                        )
-                        .secondary_action(
-                            button::standard(fl!("remove-cancel"))
-                                .on_press(Message::CancelRemoval),
-                        )
-                    }
-                    Err(error) => dialog
-                        .control(text::caption(error))
-                        .primary_action(
-                            button::standard(fl!("remove-close"))
-                                .on_press(Message::CancelRemoval),
-                        ),
-                };
             }
         }
 
-        Some(dialog.into())
+        Some(window.into())
     }
 
     fn detail(&self, app: &InstalledApp) -> Element<'_, Message> {
@@ -569,10 +785,16 @@ impl AppManager {
             .spacing(6)
         } else {
             widget::column![
-                button::destructive(fl!("remove")).on_press(Message::StartRemoval(app.id.clone()))
+                button::destructive(fl!("remove"))
+                    .on_press(Message::StartDetailedRemoval(app.id.clone()))
             ]
         };
         content = content.push(remove);
+        content = content.push(
+            widget::checkbox(self.confirm_removals)
+                .label(fl!("ask-before-removing"))
+                .on_toggle(Message::SetConfirmRemovals),
+        );
 
         pane(scrollable(content).height(Length::Fill).into())
     }
@@ -589,27 +811,116 @@ impl AppManager {
     }
 }
 
+fn plan_dialog<'a>(
+    mut window: widget::dialog::Dialog<'a, Message>,
+    app: &InstalledApp,
+    plan: &RemovalPlan,
+) -> widget::dialog::Dialog<'a, Message> {
+    if let Some(error) = &plan.error {
+        return window
+            .body(fl!("remove-refused"))
+            .control(text::caption(error.clone()))
+            .primary_action(button::standard(fl!("remove-close")).on_press(Message::CancelDialog));
+    }
+
+    window = window
+        .body(fl!("remove-body", name = app.name.clone()))
+        .control(text::caption(fl!("remove-package")))
+        .control(text::body(plan.target.clone()));
+
+    if !plan.extra_packages.is_empty() {
+        window = window.control(text::caption(fl!("remove-extra")));
+        for package in &plan.extra_packages {
+            window = window.control(text::caption(package.clone()));
+        }
+    }
+
+    if !plan.kept_orphans.is_empty() {
+        let count = plan.kept_orphans.len() as i64;
+        window = window.control(text::caption(fl!("remove-kept", count = count)));
+    }
+
+    match plan.origin {
+        Origin::Apt => {
+            window = window.control(text::caption(fl!("remove-shared-libs")));
+        }
+        Origin::Flatpak => {
+            window = window.control(text::caption(fl!("remove-flatpak-note")));
+        }
+        Origin::AppImage => {
+            window = window.control(text::caption(fl!("remove-appimage-note")));
+        }
+    }
+
+    window
+        .primary_action(button::destructive(fl!("remove-confirm")).on_press(Message::ConfirmPlan))
+        .secondary_action(button::standard(fl!("remove-cancel")).on_press(Message::CancelDialog))
+}
+
 fn load_inventory() -> Task<Message> {
     Task::perform(async { build_inventory(&RealProbe::new()) }, |apps| {
         cosmic::Action::App(Message::Loaded(apps))
     })
 }
 
-/// Runs the removal off the UI thread. `pkexec` and `gio` may wait for a
-/// password or a trash operation, so the app must stay responsive.
+fn check_auth() -> Task<Message> {
+    Task::perform(async { is_authorized() }, |authorized| {
+        cosmic::Action::App(Message::AuthChecked(authorized))
+    })
+}
+
+fn quick_check(app: InstalledApp) -> Task<Message> {
+    let id = app.id.clone();
+    Task::perform(
+        async move {
+            let probe = RealProbe::new();
+            plan_for(&app, |package| probe.simulate_apt_remove(package))
+        },
+        move |plan| cosmic::Action::App(Message::QuickChecked { id, plan }),
+    )
+}
+
+fn detailed_plan(app: InstalledApp) -> Task<Message> {
+    let id = app.id.clone();
+    Task::perform(
+        async move {
+            let probe = RealProbe::new();
+            plan_for(&app, |package| probe.simulate_apt_remove(package))
+        },
+        move |plan| cosmic::Action::App(Message::PlanReady { id, plan }),
+    )
+}
+
+/// Runs the removal off the UI thread. `sudo` and `gio` may wait on disk, so
+/// the app must stay responsive.
 fn remove_app(app: InstalledApp) -> Task<Message> {
     Task::perform(
         async move {
             let (sender, receiver) = cosmic::iced::futures::channel::oneshot::channel();
+            let thread_app = app.clone();
             std::thread::spawn(move || {
-                let _ = sender.send(run_removal(&app));
+                let _ = sender.send(run_removal(&thread_app));
             });
-            receiver
+            let result = receiver
                 .await
-                .unwrap_or_else(|_| Err("the removal stopped unexpectedly".to_owned()))
+                .unwrap_or_else(|_| Err("the removal stopped unexpectedly".to_owned()));
+            (app, result)
         },
-        |result| cosmic::Action::App(Message::Removed(result)),
+        |(app, result)| cosmic::Action::App(Message::Removed { app, result }),
     )
+}
+
+/// sudo says this when its timestamp is gone, so the app can ask again.
+fn needs_password(error: &str) -> bool {
+    error.to_lowercase().contains("password is required")
+}
+
+/// Overwrites the password buffer before releasing it.
+fn wipe(mut text: String) {
+    unsafe {
+        text.as_mut_vec().fill(0);
+    }
+    text.clear();
 }
 
 fn centred(message: String) -> Element<'static, Message> {
@@ -650,8 +961,8 @@ fn group_caption(kind: GroupKind) -> String {
     }
 }
 
-/// One app row with its three-dot menu. Clicking the row opens the details;
-/// the menu opens on top when `menu_open`.
+/// One app row with its three-dot menu. The row itself is not clickable:
+/// details open from the menu, so removing stays a deliberate action.
 fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'static, Message> {
     let icon_name = app
         .icon
@@ -703,36 +1014,34 @@ fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'stat
         cosmic::theme::Container::Transparent
     };
 
-    let row = container(row)
+    let row: Element<'static, Message> = container(row)
         .padding(8)
         .width(Length::Fill)
-        .class(style);
-
-    let content: Element<'static, Message> = widget::mouse_area(row)
-        .on_press(Message::Select(app.id.clone()))
+        .class(style)
         .into();
 
     if menu_open {
-        widget::popover(content)
+        widget::popover(row)
             .popup(menu_popup(app))
             .position(widget::popover::Position::Bottom)
             .on_close(Message::CloseMenu)
             .into()
     } else {
-        content
+        row
     }
 }
 
 fn menu_popup(app: &InstalledApp) -> Element<'static, Message> {
-    let details: Element<'static, Message> =
-        button::text(fl!("details")).on_press(Message::OpenDetails(app.id.clone())).into();
+    let details: Element<'static, Message> = button::text(fl!("details"))
+        .on_press(Message::OpenDetails(app.id.clone()))
+        .into();
 
     let mut menu = widget::column![details].spacing(4).width(Length::Fixed(220.0));
     if app.protected {
         menu = menu.push(text::caption(fl!("remove-blocked")));
     } else {
         let remove: Element<'static, Message> = button::destructive(fl!("remove"))
-            .on_press(Message::StartRemoval(app.id.clone()))
+            .on_press(Message::StartQuickRemoval(app.id.clone()))
             .into();
         menu = menu.push(remove);
     }

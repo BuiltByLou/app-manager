@@ -184,7 +184,8 @@ impl RemovalCommand {
     pub fn argv(&self) -> Vec<String> {
         match self {
             RemovalCommand::Apt { package } => vec![
-                "pkexec".to_owned(),
+                "sudo".to_owned(),
+                "-n".to_owned(),
                 "env".to_owned(),
                 "DEBIAN_FRONTEND=noninteractive".to_owned(),
                 "apt-get".to_owned(),
@@ -200,7 +201,8 @@ impl RemovalCommand {
                 id.clone(),
             ],
             RemovalCommand::Flatpak { id, user: false } => vec![
-                "pkexec".to_owned(),
+                "sudo".to_owned(),
+                "-n".to_owned(),
                 "flatpak".to_owned(),
                 "uninstall".to_owned(),
                 "--assume-yes".to_owned(),
@@ -272,6 +274,79 @@ fn is_safe_name(value: &str, extra: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+}
+
+/// Whether sudo already holds a valid authorization for this user, without
+/// prompting for anything.
+pub fn is_authorized() -> bool {
+    std::process::Command::new("sudo")
+        .args(["-n", "-v"])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Authorizes sudo for a while using the user's password. The password is
+/// written to sudo's stdin and is never part of the command line. After this
+/// succeeds, removals run with `sudo -n` and do not ask again.
+pub fn authorize(password: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    if password.is_empty() {
+        return Err("the password is empty".to_owned());
+    }
+
+    let mut child = std::process::Command::new("sudo")
+        .args(["-S", "-p", "", "-v"])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run sudo: {error}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(password.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .map_err(|error| format!("could not send the password: {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for sudo: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        Err("sudo refused the authorization".to_owned())
+    } else {
+        Err(stderr)
+    }
+}
+
+/// Keeps the sudo authorization alive by refreshing its timestamp. It runs
+/// silently and stops when the process exits.
+pub fn keep_sudo_alive() {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(50));
+            let _ = std::process::Command::new("sudo")
+                .args(["-n", "-v"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    });
 }
 
 /// Runs the removal. It blocks until the command finishes, so the caller must
@@ -426,12 +501,13 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
     }
 
     #[test]
-    fn apt_command_runs_through_pkexec_without_a_shell() {
+    fn apt_command_runs_through_sudo_without_a_shell() {
         let command = removal_command(&app("Firefox", "firefox", Origin::Apt)).unwrap();
         assert_eq!(
             command.argv(),
             vec![
-                "pkexec",
+                "sudo",
+                "-n",
                 "env",
                 "DEBIAN_FRONTEND=noninteractive",
                 "apt-get",
@@ -467,7 +543,8 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
         assert_eq!(
             command.argv(),
             vec![
-                "pkexec",
+                "sudo",
+                "-n",
                 "flatpak",
                 "uninstall",
                 "--assume-yes",
@@ -505,5 +582,10 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
         let mut file = app("Tool", "", Origin::AppImage);
         file.id = "appimage:tool.AppImage".to_owned();
         assert!(removal_command(&file).is_err());
+    }
+
+    #[test]
+    fn refuses_an_empty_password_without_running_sudo() {
+        assert!(authorize("").is_err());
     }
 }
