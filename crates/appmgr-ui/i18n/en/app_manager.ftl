@@ -26,6 +26,8 @@ protected-title = Protected
 protected-caption = Part of the system; removing may break it.
 removable-title = Removable
 removable-caption = Installed by the system, but safe to remove.
+show-protected = Show locked ({ $count })
+hide-protected = Hide locked ({ $count })
 
 origin-apt = APT
 origin-flatpak = Flatpak
@@ -43,17 +45,24 @@ status-removable = Removable
 remove = Remove
 remove-blocked = Part of the system. It cannot be removed here.
 
-preview-title = Removal preview
-preview-simulation = This is a simulation. Nothing will be removed.
-preview-will-remove = This will remove:
-preview-extra = Also removed because they depend on it:
-preview-kept = { $count ->
+remove-title = Remove app
+remove-planning = Asking the system what this will remove…
+remove-body = { $name } will be removed.
+remove-package = Package
+remove-extra = Also removed because they depend on it:
+remove-kept = { $count ->
     [one] { $count } automatically installed package is no longer needed, but it stays installed.
    *[other] { $count } automatically installed packages are no longer needed, but they stay installed.
 }
-preview-flatpak-note = The Flatpak app is removed. Its data in your home folder stays.
-preview-appimage-note = The AppImage file is removed. Other files are not touched.
-preview-error = The system refused this removal:
-preview-shared-libs = Libraries used by other apps stay installed.
-planning = Asking the system…
-back = Back
+remove-shared-libs = Libraries used by other apps stay installed.
+remove-flatpak-note = The Flatpak app is removed. Its data in your home folder stays.
+remove-appimage-note = The AppImage file is moved to the trash. Other files are not touched.
+remove-needs-permission = You will be asked for your administrator password.
+remove-confirm = Remove
+remove-cancel = Cancel
+remove-running = Removing… Waiting for the system.
+remove-running-note = If no password window appears, your desktop is missing a PolicyKit authentication agent. Nothing is being removed while it waits.
+remove-running-close = Close
+remove-failed = The removal failed:
+remove-refused = The system refused this removal:
+remove-close = Close

@@ -40,23 +40,25 @@ pub fn apps_for(apps: &[App], kind: InstallKind, query: &str) -> Vec<App> {
     matching
 }
 
-/// The system apps, split between protected and removable.
-pub fn system_groups(apps: &[App], query: &str) -> Vec<Group> {
+/// The system apps, split between removable and protected. Removable ones come
+/// first; protected ones are locked, so they sit at the bottom and can be
+/// hidden. `show_protected` keeps them out of the list entirely when false.
+pub fn system_groups(apps: &[App], query: &str, show_protected: bool) -> Vec<Group> {
     let (protected, removable): (Vec<App>, Vec<App>) = apps_for(apps, InstallKind::System, query)
         .into_iter()
         .partition(|app| app.protected);
 
     let mut groups = Vec::new();
-    if !protected.is_empty() {
-        groups.push(Group {
-            kind: GroupKind::Protected,
-            apps: protected,
-        });
-    }
     if !removable.is_empty() {
         groups.push(Group {
             kind: GroupKind::Removable,
             apps: removable,
+        });
+    }
+    if show_protected && !protected.is_empty() {
+        groups.push(Group {
+            kind: GroupKind::Protected,
+            apps: protected,
         });
     }
     groups
@@ -155,26 +157,34 @@ mod tests {
 
     #[test]
     fn separates_protected_system_apps_from_the_rest() {
-        let groups = system_groups(&sample(), "");
+        let groups = system_groups(&sample(), "", true);
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].kind, GroupKind::Protected);
-        assert_eq!(groups[0].apps[0].name, "COSMIC Store");
-        assert_eq!(groups[1].kind, GroupKind::Removable);
-        assert_eq!(groups[1].apps[0].name, "Firefox");
+        assert_eq!(groups[0].kind, GroupKind::Removable);
+        assert_eq!(groups[0].apps[0].name, "Firefox");
+        assert_eq!(groups[1].kind, GroupKind::Protected);
+        assert_eq!(groups[1].apps[0].name, "COSMIC Store");
     }
 
     #[test]
     fn hides_a_system_group_when_it_is_empty() {
         let apps = vec![app_with("COSMIC Store", InstallKind::System, true)];
-        let groups = system_groups(&apps, "");
+        let groups = system_groups(&apps, "", true);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].kind, GroupKind::Protected);
     }
 
     #[test]
+    fn hides_protected_apps_when_asked_to() {
+        let groups = system_groups(&sample(), "", false);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::Removable);
+        assert_eq!(groups[0].apps[0].name, "Firefox");
+    }
+
+    #[test]
     fn search_applies_to_both_system_groups() {
         let apps = sample();
-        let groups = system_groups(&apps, "firefox");
+        let groups = system_groups(&apps, "firefox", true);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].kind, GroupKind::Removable);
     }

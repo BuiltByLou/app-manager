@@ -8,8 +8,8 @@ use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
 use appmgr_core::real::RealProbe;
-use appmgr_core::removal::{RemovalPlan, plan_for};
-use view_model::{Group, GroupKind, apps_for, format_size, system_groups};
+use appmgr_core::removal::{RemovalPlan, plan_for, removal_command, run_removal};
+use view_model::{Group, GroupKind, apps_for, filter, format_size, system_groups};
 
 const APP_ID: &str = "io.github.builtbylou.app_manager";
 
@@ -43,14 +43,19 @@ impl Page {
             Page::Maintainer => "software-update-available-symbolic",
         }
     }
+}
 
-    fn kind(self) -> Option<InstallKind> {
-        match self {
-            Page::User => Some(InstallKind::User),
-            Page::System => Some(InstallKind::System),
-            Page::Maintainer => None,
-        }
-    }
+/// Where a removal is in its life cycle. The dialog follows this.
+enum Stage {
+    Planning,
+    Ready(RemovalPlan),
+    Running,
+    Failed(String),
+}
+
+struct RemovalState {
+    app: InstalledApp,
+    stage: Stage,
 }
 
 #[derive(Debug, Clone)]
@@ -60,9 +65,15 @@ pub enum Message {
     Search(String),
     Select(String),
     CloseDetail,
-    PreviewRemoval,
+    ToggleProtected,
+    OpenMenu(String),
+    CloseMenu,
+    OpenDetails(String),
+    StartRemoval(String),
     Planned(RemovalPlan),
-    BackToDetail,
+    ConfirmRemoval,
+    CancelRemoval,
+    Removed(Result<(), String>),
 }
 
 pub struct AppManager {
@@ -73,9 +84,12 @@ pub struct AppManager {
     loading: bool,
     /// Id of the app whose details are open.
     selected: Option<String>,
-    /// Preview shown instead of the details once computed.
-    plan: Option<RemovalPlan>,
-    planning: bool,
+    /// Whether locked system apps are listed.
+    show_protected: bool,
+    /// Id of the app whose three-dot menu is open.
+    menu: Option<String>,
+    /// The removal in progress, shown in the dialog.
+    removal: Option<RemovalState>,
 }
 
 impl Application for AppManager {
@@ -111,8 +125,9 @@ impl Application for AppManager {
                 query: String::new(),
                 loading: true,
                 selected: None,
-                plan: None,
-                planning: false,
+                show_protected: true,
+                menu: None,
+                removal: None,
             },
             load_inventory(),
         )
@@ -125,7 +140,7 @@ impl Application for AppManager {
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
         self.nav_model.activate(id);
         self.selected = None;
-        self.plan = None;
+        self.menu = None;
         Task::none()
     }
 
@@ -134,7 +149,7 @@ impl Application for AppManager {
             Message::Refresh => {
                 self.loading = true;
                 self.selected = None;
-                self.plan = None;
+                self.menu = None;
                 load_inventory()
             }
             Message::Loaded(apps) => {
@@ -147,46 +162,89 @@ impl Application for AppManager {
             }
             Message::Search(query) => {
                 self.query = query;
+                self.menu = None;
+                if let Some(selected) = self.selected.clone()
+                    && !filter(&self.apps, &self.query)
+                        .iter()
+                        .any(|app| app.id == selected)
+                {
+                    self.selected = None;
+                }
                 Task::none()
             }
             Message::Select(id) => {
-                self.plan = None;
-                self.planning = false;
+                self.menu = None;
                 self.selected = Some(id);
                 Task::none()
             }
             Message::CloseDetail => {
                 self.selected = None;
-                self.plan = None;
-                self.planning = false;
                 Task::none()
             }
-            Message::PreviewRemoval => {
-                let Some(app) = self.selected_app().cloned() else {
+            Message::ToggleProtected => {
+                self.show_protected = !self.show_protected;
+                if self
+                    .selected_app()
+                    .is_some_and(|app| app.protected && !self.show_protected)
+                {
+                    self.selected = None;
+                }
+                Task::none()
+            }
+            Message::OpenMenu(id) => {
+                self.menu = Some(id);
+                Task::none()
+            }
+            Message::CloseMenu => {
+                self.menu = None;
+                Task::none()
+            }
+            Message::OpenDetails(id) => {
+                self.menu = None;
+                self.selected = Some(id);
+                Task::none()
+            }
+            Message::StartRemoval(id) => self.begin_removal(id),
+            Message::Planned(plan) => {
+                if let Some(state) = &mut self.removal
+                    && matches!(state.stage, Stage::Planning)
+                {
+                    state.stage = Stage::Ready(plan);
+                }
+                Task::none()
+            }
+            Message::ConfirmRemoval => {
+                let Some(state) = &self.removal else {
                     return Task::none();
                 };
-                if app.protected {
+                if !matches!(state.stage, Stage::Ready(_)) {
                     return Task::none();
                 }
-                self.planning = true;
-                self.plan = None;
-                Task::perform(
-                    async move {
-                        let probe = RealProbe::new();
-                        plan_for(&app, |package| probe.simulate_apt_remove(package))
-                    },
-                    |plan| cosmic::Action::App(Message::Planned(plan)),
-                )
+                let app = state.app.clone();
+                if let Some(state) = &mut self.removal {
+                    state.stage = Stage::Running;
+                }
+                remove_app(app)
             }
-            Message::Planned(plan) => {
-                self.planning = false;
-                self.plan = Some(plan);
+            Message::CancelRemoval => {
+                self.removal = None;
                 Task::none()
             }
-            Message::BackToDetail => {
-                self.plan = None;
-                Task::none()
-            }
+            Message::Removed(result) => match result {
+                Ok(()) => {
+                    self.removal = None;
+                    self.selected = None;
+                    self.menu = None;
+                    self.loading = true;
+                    load_inventory()
+                }
+                Err(error) => {
+                    if let Some(state) = &mut self.removal {
+                        state.stage = Stage::Failed(error);
+                    }
+                    Task::none()
+                }
+            },
         }
     }
 
@@ -194,7 +252,7 @@ impl Application for AppManager {
         let page = self.page();
         let mut content = widget::column![text::title3(page.title())].spacing(12);
 
-        if page.kind().is_some() {
+        if matches!(page, Page::User | Page::System) {
             content = content.push(self.search_row());
         }
 
@@ -210,6 +268,10 @@ impl Application for AppManager {
         }
 
         container(content.padding(20).width(Length::Fill).height(Length::Fill)).into()
+    }
+
+    fn dialog(&self) -> Option<Element<'_, Message>> {
+        self.removal_dialog()
     }
 }
 
@@ -251,7 +313,9 @@ impl AppManager {
         match page {
             Page::Maintainer => centred(fl!("maintainer-soon")),
             Page::User => self.list_page(apps_for(&self.apps, InstallKind::User, &self.query)),
-            Page::System => self.system_page(system_groups(&self.apps, &self.query)),
+            Page::System => {
+                self.system_page(system_groups(&self.apps, &self.query, self.show_protected))
+            }
         }
     }
 
@@ -264,18 +328,40 @@ impl AppManager {
         let mut list = widget::column![].spacing(4);
         list = list.push(text::caption(fl!("apps-count", count = count)));
         for app in &apps {
-            list = list.push(app_row(app, self.is_selected(&app.id)));
+            list = list.push(app_row(app, self.is_selected(&app.id), self.is_menu_open(&app.id)));
         }
 
         scrollable(list).height(Length::Fill).into()
     }
 
     fn system_page(&self, groups: Vec<Group>) -> Element<'_, Message> {
-        if groups.is_empty() {
-            return centred(self.empty_message());
+        let mut list = widget::column![].spacing(4);
+        let protected = self.protected_count();
+
+        if protected > 0 {
+            let count = protected as i64;
+            let label = if self.show_protected {
+                fl!("hide-protected", count = count)
+            } else {
+                fl!("show-protected", count = count)
+            };
+            list = list.push(
+                widget::row![
+                    button::text(label).on_press(Message::ToggleProtected),
+                    widget::Space::new().width(Length::Fill),
+                ]
+                .padding([0, 0, 8, 0]),
+            );
         }
 
-        let mut list = widget::column![].spacing(4);
+        if groups.is_empty() {
+            if !self.query.trim().is_empty() {
+                list = list.push(text::body(fl!("no-results")));
+            } else if self.show_protected || protected == 0 {
+                list = list.push(text::body(fl!("no-apps")));
+            }
+        }
+
         for group in groups {
             let count = group.apps.len() as i64;
             list = list.push(text::title3(group_title(group.kind)));
@@ -285,15 +371,31 @@ impl AppManager {
                 fl!("apps-count", count = count)
             )));
             for app in &group.apps {
-                list = list.push(app_row(app, self.is_selected(&app.id)));
+                list = list.push(app_row(
+                    app,
+                    self.is_selected(&app.id),
+                    self.is_menu_open(&app.id),
+                ));
             }
         }
 
         scrollable(list).height(Length::Fill).into()
     }
 
+    /// Locked system apps that match the current search, shown or not.
+    fn protected_count(&self) -> usize {
+        apps_for(&self.apps, InstallKind::System, &self.query)
+            .iter()
+            .filter(|app| app.protected)
+            .count()
+    }
+
     fn is_selected(&self, id: &str) -> bool {
         self.selected.as_deref() == Some(id)
+    }
+
+    fn is_menu_open(&self, id: &str) -> bool {
+        self.menu.as_deref() == Some(id)
     }
 
     fn empty_message(&self) -> String {
@@ -304,28 +406,136 @@ impl AppManager {
         }
     }
 
-    fn detail(&self, app: &InstalledApp) -> Element<'_, Message> {
-        if self.planning {
-            return pane(
-                widget::column![
-                    self.pane_header(fl!("preview-title"), None),
-                    text::body(fl!("planning")),
-                ]
-                .spacing(12)
-                .into(),
-            );
-        }
+    /// Starts a removal: asks the system what it would do, then shows the
+    /// dialog. Nothing is removed until the user confirms.
+    fn begin_removal(&mut self, id: String) -> Task<Message> {
+        let Some(app) = self
+            .apps
+            .iter()
+            .find(|app| app.id == id && !app.protected)
+            .cloned()
+        else {
+            return Task::none();
+        };
 
-        if let Some(plan) = &self.plan {
-            return self.preview(app, plan);
-        }
+        self.menu = None;
+        self.removal = Some(RemovalState {
+            app: app.clone(),
+            stage: Stage::Planning,
+        });
 
-        self.app_details(app)
+        Task::perform(
+            async move {
+                let probe = RealProbe::new();
+                plan_for(&app, |package| probe.simulate_apt_remove(package))
+            },
+            |plan| cosmic::Action::App(Message::Planned(plan)),
+        )
     }
 
-    fn app_details(&self, app: &InstalledApp) -> Element<'_, Message> {
+    fn removal_dialog(&self) -> Option<Element<'_, Message>> {
+        let state = self.removal.as_ref()?;
+        let app = &state.app;
+        let mut dialog = widget::dialog::dialog()
+            .title(fl!("remove-title"))
+            .max_width(520.0);
+
+        match &state.stage {
+            Stage::Planning => {
+                dialog = dialog.body(fl!("remove-planning")).secondary_action(
+                    button::standard(fl!("remove-cancel")).on_press(Message::CancelRemoval),
+                );
+            }
+            Stage::Running => {
+                dialog = dialog
+                    .body(fl!("remove-running"))
+                    .control(text::caption(fl!("remove-running-note")))
+                    .secondary_action(
+                        button::standard(fl!("remove-running-close"))
+                            .on_press(Message::CancelRemoval),
+                    );
+            }
+            Stage::Failed(error) => {
+                dialog = dialog
+                    .body(fl!("remove-failed"))
+                    .control(text::caption(error.clone()))
+                    .primary_action(
+                        button::standard(fl!("remove-close"))
+                            .on_press(Message::CancelRemoval),
+                    );
+            }
+            Stage::Ready(plan) => {
+                let mut controls: Vec<Element<'_, Message>> = Vec::new();
+
+                if let Some(error) = &plan.error {
+                    dialog = dialog.body(fl!("remove-refused"));
+                    controls.push(text::caption(error.clone()).into());
+                } else {
+                    dialog = dialog.body(fl!("remove-body", name = app.name.clone()));
+                    controls.push(text::caption(fl!("remove-package")).into());
+                    controls.push(text::body(plan.target.clone()).into());
+
+                    if !plan.extra_packages.is_empty() {
+                        controls.push(text::caption(fl!("remove-extra")).into());
+                        for package in &plan.extra_packages {
+                            controls.push(text::caption(package.clone()).into());
+                        }
+                    }
+
+                    if !plan.kept_orphans.is_empty() {
+                        let count = plan.kept_orphans.len() as i64;
+                        controls.push(text::caption(fl!("remove-kept", count = count)).into());
+                    }
+
+                    match plan.origin {
+                        Origin::Apt => {
+                            controls.push(text::caption(fl!("remove-shared-libs")).into());
+                        }
+                        Origin::Flatpak => {
+                            controls.push(text::caption(fl!("remove-flatpak-note")).into());
+                        }
+                        Origin::AppImage => {
+                            controls.push(text::caption(fl!("remove-appimage-note")).into());
+                        }
+                    }
+                }
+
+                for control in controls {
+                    dialog = dialog.control(control);
+                }
+
+                dialog = match removal_command(app) {
+                    Ok(command) => {
+                        if command.needs_permission() {
+                            dialog.control(text::caption(fl!("remove-needs-permission")))
+                        } else {
+                            dialog
+                        }
+                        .primary_action(
+                            button::destructive(fl!("remove-confirm"))
+                                .on_press(Message::ConfirmRemoval),
+                        )
+                        .secondary_action(
+                            button::standard(fl!("remove-cancel"))
+                                .on_press(Message::CancelRemoval),
+                        )
+                    }
+                    Err(error) => dialog
+                        .control(text::caption(error))
+                        .primary_action(
+                            button::standard(fl!("remove-close"))
+                                .on_press(Message::CancelRemoval),
+                        ),
+                };
+            }
+        }
+
+        Some(dialog.into())
+    }
+
+    fn detail(&self, app: &InstalledApp) -> Element<'_, Message> {
         let mut content = widget::column![].spacing(12);
-        content = content.push(self.pane_header(fl!("details"), None));
+        content = content.push(self.pane_header(fl!("details")));
 
         let icon_name = app
             .icon
@@ -359,7 +569,7 @@ impl AppManager {
             .spacing(6)
         } else {
             widget::column![
-                button::destructive(fl!("remove")).on_press(Message::PreviewRemoval)
+                button::destructive(fl!("remove")).on_press(Message::StartRemoval(app.id.clone()))
             ]
         };
         content = content.push(remove);
@@ -367,76 +577,15 @@ impl AppManager {
         pane(scrollable(content).height(Length::Fill).into())
     }
 
-    fn preview(&self, app: &InstalledApp, plan: &RemovalPlan) -> Element<'_, Message> {
-        let mut content = widget::column![].spacing(12);
-        content = content.push(self.pane_header(fl!("preview-title"), Some(Message::BackToDetail)));
-        content = content.push(text::title2(app.name.clone()));
-        content = content.push(text::caption(fl!("preview-simulation")));
-
-        if let Some(error) = &plan.error {
-            content = content.push(text::body(fl!("preview-error")));
-            content = content.push(text::caption(error.clone()));
-            return pane(scrollable(content).height(Length::Fill).into());
-        }
-
-        content = content.push(text::body(fl!("preview-will-remove")));
-        let small_icon: Element<'_, Message> = widget::icon::from_name(
-            app.icon
-                .clone()
-                .unwrap_or_else(|| "application-x-executable".to_owned()),
-        )
-        .size(20)
-        .into();
-        content = content.push(
-            widget::row![small_icon, text::body(app.name.clone())]
-                .spacing(8)
-                .align_y(Alignment::Center),
-        );
-
-        if !plan.extra_packages.is_empty() {
-            content = content.push(text::caption(fl!("preview-extra")));
-            for package in &plan.extra_packages {
-                content = content.push(text::caption(package.clone()));
-            }
-        }
-
-        if !plan.kept_orphans.is_empty() {
-            let count = plan.kept_orphans.len() as i64;
-            content = content.push(text::caption(fl!("preview-kept", count = count)));
-        }
-
-        match plan.origin {
-            Origin::Apt => {
-                content = content.push(text::caption(fl!("preview-shared-libs")));
-            }
-            Origin::Flatpak => {
-                content = content.push(text::caption(fl!("preview-flatpak-note")));
-            }
-            Origin::AppImage => {
-                content = content.push(text::caption(fl!("preview-appimage-note")));
-                content = content.push(text::caption(plan.target.clone()));
-            }
-        }
-
-        content = content.push(button::standard(fl!("back")).on_press(Message::BackToDetail));
-
-        pane(scrollable(content).height(Length::Fill).into())
-    }
-
-    fn pane_header(&self, title: String, back: Option<Message>) -> Element<'_, Message> {
-        let mut row = widget::row![].spacing(8).align_y(Alignment::Center);
-        if let Some(message) = back {
-            row = row.push(
-                button::icon(widget::icon::from_name("go-previous-symbolic").size(16))
-                    .on_press(message),
-            );
-        }
-        row = row.push(container(text::title3(title)).width(Length::Fill));
-        row = row.push(
+    fn pane_header(&self, title: String) -> Element<'_, Message> {
+        widget::row![
+            container(text::title3(title)).width(Length::Fill),
             button::icon(widget::icon::from_name("window-close-symbolic").size(16))
                 .on_press(Message::CloseDetail),
-        );
-        row.into()
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
     }
 }
 
@@ -444,6 +593,23 @@ fn load_inventory() -> Task<Message> {
     Task::perform(async { build_inventory(&RealProbe::new()) }, |apps| {
         cosmic::Action::App(Message::Loaded(apps))
     })
+}
+
+/// Runs the removal off the UI thread. `pkexec` and `gio` may wait for a
+/// password or a trash operation, so the app must stay responsive.
+fn remove_app(app: InstalledApp) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (sender, receiver) = cosmic::iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(run_removal(&app));
+            });
+            receiver
+                .await
+                .unwrap_or_else(|_| Err("the removal stopped unexpectedly".to_owned()))
+        },
+        |result| cosmic::Action::App(Message::Removed(result)),
+    )
 }
 
 fn centred(message: String) -> Element<'static, Message> {
@@ -484,7 +650,9 @@ fn group_caption(kind: GroupKind) -> String {
     }
 }
 
-fn app_row(app: &InstalledApp, selected: bool) -> Element<'static, Message> {
+/// One app row with its three-dot menu. Clicking the row opens the details;
+/// the menu opens on top when `menu_open`.
+fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'static, Message> {
     let icon_name = app
         .icon
         .clone()
@@ -504,10 +672,18 @@ fn app_row(app: &InstalledApp, selected: bool) -> Element<'static, Message> {
         .spacing(2)
         .width(Length::Fill);
 
-    let mut row = widget::row![icon, labels].spacing(12).align_y(Alignment::Center);
+    let mut row = widget::row![icon, labels]
+        .spacing(12)
+        .align_y(Alignment::Center);
     if app.protected {
         row = row.push(widget::icon::from_name("changes-prevent-symbolic").size(16));
     }
+
+    let menu_button: Element<'static, Message> =
+        button::icon(widget::icon::from_name("open-menu-symbolic").size(16))
+            .on_press(Message::OpenMenu(app.id.clone()))
+            .into();
+    row = row.push(menu_button);
 
     let style = if selected {
         cosmic::theme::Container::custom(|theme| {
@@ -532,8 +708,38 @@ fn app_row(app: &InstalledApp, selected: bool) -> Element<'static, Message> {
         .width(Length::Fill)
         .class(style);
 
-    widget::mouse_area(row)
+    let content: Element<'static, Message> = widget::mouse_area(row)
         .on_press(Message::Select(app.id.clone()))
+        .into();
+
+    if menu_open {
+        widget::popover(content)
+            .popup(menu_popup(app))
+            .position(widget::popover::Position::Bottom)
+            .on_close(Message::CloseMenu)
+            .into()
+    } else {
+        content
+    }
+}
+
+fn menu_popup(app: &InstalledApp) -> Element<'static, Message> {
+    let details: Element<'static, Message> =
+        button::text(fl!("details")).on_press(Message::OpenDetails(app.id.clone())).into();
+
+    let mut menu = widget::column![details].spacing(4).width(Length::Fixed(220.0));
+    if app.protected {
+        menu = menu.push(text::caption(fl!("remove-blocked")));
+    } else {
+        let remove: Element<'static, Message> = button::destructive(fl!("remove"))
+            .on_press(Message::StartRemoval(app.id.clone()))
+            .into();
+        menu = menu.push(remove);
+    }
+
+    container(menu)
+        .padding(6)
+        .class(cosmic::theme::Container::Dropdown)
         .into()
 }
 

@@ -2,7 +2,7 @@
 //! changing anything: shared libraries used by other apps stay installed.
 
 use crate::dpkg::base_name;
-use crate::inventory::{App, Origin};
+use crate::inventory::{App, InstallKind, Origin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovalPlan {
@@ -164,6 +164,145 @@ fn push_unique(list: &mut Vec<String>, name: &str) {
     }
 }
 
+/// The exact command that performs a removal. It is built as an argument
+/// list, never through a shell, and every value is checked first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalCommand {
+    Apt {
+        package: String,
+    },
+    Flatpak {
+        id: String,
+        user: bool,
+    },
+    AppImage {
+        path: String,
+    },
+}
+
+impl RemovalCommand {
+    pub fn argv(&self) -> Vec<String> {
+        match self {
+            RemovalCommand::Apt { package } => vec![
+                "pkexec".to_owned(),
+                "env".to_owned(),
+                "DEBIAN_FRONTEND=noninteractive".to_owned(),
+                "apt-get".to_owned(),
+                "-y".to_owned(),
+                "remove".to_owned(),
+                package.clone(),
+            ],
+            RemovalCommand::Flatpak { id, user: true } => vec![
+                "flatpak".to_owned(),
+                "uninstall".to_owned(),
+                "--assume-yes".to_owned(),
+                "--user".to_owned(),
+                id.clone(),
+            ],
+            RemovalCommand::Flatpak { id, user: false } => vec![
+                "pkexec".to_owned(),
+                "flatpak".to_owned(),
+                "uninstall".to_owned(),
+                "--assume-yes".to_owned(),
+                "--system".to_owned(),
+                id.clone(),
+            ],
+            RemovalCommand::AppImage { path } => {
+                vec!["gio".to_owned(), "trash".to_owned(), path.clone()]
+            }
+        }
+    }
+
+    /// Whether the command needs the administrator password.
+    pub fn needs_permission(&self) -> bool {
+        match self {
+            RemovalCommand::Apt { .. } | RemovalCommand::Flatpak { user: false, .. } => true,
+            RemovalCommand::Flatpak { user: true, .. } | RemovalCommand::AppImage { .. } => false,
+        }
+    }
+}
+
+/// Builds the command for an app, refusing names that could be read as
+/// options or that do not belong to the expected shape.
+pub fn removal_command(app: &App) -> Result<RemovalCommand, String> {
+    match app.origin {
+        Origin::Apt => {
+            let package = app
+                .package
+                .as_deref()
+                .ok_or_else(|| "no package is associated with this app".to_owned())?;
+            if !is_safe_name(package, "+-.:") {
+                return Err(format!("refusing unsafe package name: {package}"));
+            }
+            Ok(RemovalCommand::Apt {
+                package: package.to_owned(),
+            })
+        }
+        Origin::Flatpak => {
+            let id = app
+                .package
+                .as_deref()
+                .ok_or_else(|| "no Flatpak id is associated with this app".to_owned())?;
+            if !is_safe_name(id, "._-") {
+                return Err(format!("refusing unsafe Flatpak id: {id}"));
+            }
+            Ok(RemovalCommand::Flatpak {
+                id: id.to_owned(),
+                user: app.kind == InstallKind::User,
+            })
+        }
+        Origin::AppImage => {
+            let path = app
+                .id
+                .strip_prefix("appimage:")
+                .ok_or_else(|| "the AppImage has no file path".to_owned())?;
+            if !path.starts_with('/') || path.contains('\n') {
+                return Err(format!("refusing unsafe AppImage path: {path}"));
+            }
+            Ok(RemovalCommand::AppImage {
+                path: path.to_owned(),
+            })
+        }
+    }
+}
+
+fn is_safe_name(value: &str, extra: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+}
+
+/// Runs the removal. It blocks until the command finishes, so the caller must
+/// keep it off the UI thread.
+pub fn run_removal(app: &App) -> Result<(), String> {
+    let command = removal_command(app)?;
+    let argv = command.argv();
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "empty removal command".to_owned())?;
+
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        Err(format!(
+            "{program} stopped with exit code {}",
+            output.status.code().unwrap_or(-1)
+        ))
+    } else {
+        Err(stderr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +423,87 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
         app.id = "appimage:/home/ed/Applications/tool.AppImage".to_owned();
         let plan = plan_for(&app, |_| panic!("apt must not run for AppImage"));
         assert_eq!(plan.target, "/home/ed/Applications/tool.AppImage");
+    }
+
+    #[test]
+    fn apt_command_runs_through_pkexec_without_a_shell() {
+        let command = removal_command(&app("Firefox", "firefox", Origin::Apt)).unwrap();
+        assert_eq!(
+            command.argv(),
+            vec![
+                "pkexec",
+                "env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "-y",
+                "remove",
+                "firefox",
+            ]
+        );
+        assert!(command.needs_permission());
+    }
+
+    #[test]
+    fn user_flatpak_does_not_ask_for_a_password() {
+        let command = removal_command(&app("Day", "com.github.day", Origin::Flatpak)).unwrap();
+        assert_eq!(
+            command.argv(),
+            vec![
+                "flatpak",
+                "uninstall",
+                "--assume-yes",
+                "--user",
+                "com.github.day",
+            ]
+        );
+        assert!(!command.needs_permission());
+    }
+
+    #[test]
+    fn system_flatpak_asks_for_a_password() {
+        let mut flatpak = app("Day", "com.github.day", Origin::Flatpak);
+        flatpak.kind = crate::inventory::InstallKind::System;
+        let command = removal_command(&flatpak).unwrap();
+        assert_eq!(
+            command.argv(),
+            vec![
+                "pkexec",
+                "flatpak",
+                "uninstall",
+                "--assume-yes",
+                "--system",
+                "com.github.day",
+            ]
+        );
+        assert!(command.needs_permission());
+    }
+
+    #[test]
+    fn appimage_is_moved_to_the_trash() {
+        let mut file = app("Tool", "", Origin::AppImage);
+        file.id = "appimage:/home/ed/Applications/tool.AppImage".to_owned();
+        let command = removal_command(&file).unwrap();
+        assert_eq!(
+            command.argv(),
+            vec!["gio", "trash", "/home/ed/Applications/tool.AppImage"]
+        );
+        assert!(!command.needs_permission());
+    }
+
+    #[test]
+    fn refuses_names_that_look_like_options() {
+        let command = removal_command(&app("Evil", "--force-yes", Origin::Apt));
+        assert!(command.is_err());
+
+        let mut flatpak = app("Evil", "com.example.app,other", Origin::Flatpak);
+        flatpak.kind = crate::inventory::InstallKind::User;
+        assert!(removal_command(&flatpak).is_err());
+    }
+
+    #[test]
+    fn refuses_a_relative_appimage_path() {
+        let mut file = app("Tool", "", Origin::AppImage);
+        file.id = "appimage:tool.AppImage".to_owned();
+        assert!(removal_command(&file).is_err());
     }
 }

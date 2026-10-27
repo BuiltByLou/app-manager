@@ -169,6 +169,8 @@ Prioridade: **M** = obrigatório na v1 · **S** = desejável · **C** = futuro.
 | D7 | Apps de sistema na interface | Tudo numa lista vs. separar protegidas | **Separar em "Protegidas" e "Removíveis"**; protegidas sem ação de remover |
 | D8 | Idioma da interface | Só inglês vs. traduzido | **Inglês como origem e fallback**, Fluent, estrutura pronta para traduções |
 | D9 | Dependências na remoção | Remover órfãs automaticamente vs. deixar | **Deixar tudo o que não é a app**; bibliotecas partilhadas e órfãs ficam, nada de `autoremove` silencioso |
+| D10 | Ordem e visibilidade das protegidas | No topo vs. no fundo, sempre visíveis vs. ocultáveis | **No fundo da lista**, com botão *Show locked / Hide locked* e contagem |
+| D11 | Ações por app | Só painel de detalhe vs. menu na linha | **Três pontos em cada linha** com *Details* e *Remove*; *Remove* abre o diálogo de confirmação sem passar pelo painel |
 
 ## 12. Riscos
 
