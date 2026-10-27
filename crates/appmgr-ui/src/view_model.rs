@@ -1,12 +1,8 @@
 use appmgr_core::inventory::{App, InstallKind};
 
-pub struct Section {
-    pub title: &'static str,
-    pub apps: Vec<App>,
-}
-
 pub const USER_TITLE: &str = "Instaladas por mim";
 pub const SYSTEM_TITLE: &str = "Sistema";
+pub const MAINTAINER_TITLE: &str = "Manutenção";
 
 /// Filtra por nome ou pacote, sem distinguir maiúsculas de minúsculas.
 pub fn filter<'a>(apps: &'a [App], query: &str) -> Vec<&'a App> {
@@ -25,37 +21,15 @@ pub fn filter<'a>(apps: &'a [App], query: &str) -> Vec<&'a App> {
         .collect()
 }
 
-/// Agrupa em "instaladas por mim" e "sistema", cada uma por ordem alfabética.
-/// Secções vazias não aparecem.
-pub fn sections(apps: &[App], query: &str) -> Vec<Section> {
-    let mut user: Vec<App> = Vec::new();
-    let mut system: Vec<App> = Vec::new();
-
-    for app in filter(apps, query) {
-        match app.kind {
-            InstallKind::User => user.push(app.clone()),
-            InstallKind::System => system.push(app.clone()),
-        }
-    }
-
-    for group in [&mut user, &mut system] {
-        group.sort_by_key(|app| app.name.to_lowercase());
-    }
-
-    let mut result = Vec::new();
-    if !user.is_empty() {
-        result.push(Section {
-            title: USER_TITLE,
-            apps: user,
-        });
-    }
-    if !system.is_empty() {
-        result.push(Section {
-            title: SYSTEM_TITLE,
-            apps: system,
-        });
-    }
-    result
+/// Apps de um só grupo, filtradas e por ordem alfabética.
+pub fn apps_for(apps: &[App], kind: InstallKind, query: &str) -> Vec<App> {
+    let mut matching: Vec<App> = filter(apps, query)
+        .into_iter()
+        .filter(|app| app.kind == kind)
+        .cloned()
+        .collect();
+    matching.sort_by_key(|app| app.name.to_lowercase());
+    matching
 }
 
 /// Tamanho legível: "512 B", "12 kB", "58.2 MB", "1.4 GB".
@@ -116,34 +90,32 @@ mod tests {
     }
 
     #[test]
-    fn puts_user_section_before_system() {
-        let sections = sections(&sample(), "");
-        assert_eq!(sections.len(), 2);
-        assert_eq!(sections[0].title, USER_TITLE);
-        assert_eq!(sections[1].title, SYSTEM_TITLE);
+    fn shows_only_the_requested_group() {
+        let apps = sample();
+        let user = apps_for(&apps, InstallKind::User, "");
+        assert_eq!(user.len(), 2);
+        assert!(user.iter().all(|a| a.kind == InstallKind::User));
     }
 
     #[test]
-    fn sorts_sections_alphabetically_ignoring_case() {
-        let sections = sections(&sample(), "");
-        let user: Vec<&str> = sections[0].apps.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(user, vec!["brave", "zsh"]);
-        let system: Vec<&str> = sections[1].apps.iter().map(|a| a.name.as_str()).collect();
+    fn sorts_alphabetically_ignoring_case() {
+        let apps = sample();
+        let ordered = apps_for(&apps, InstallKind::System, "");
+        let system: Vec<&str> = ordered.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(system, vec!["COSMIC Store", "Firefox"]);
     }
 
     #[test]
-    fn hides_empty_sections() {
-        let apps = vec![app("brave", InstallKind::User)];
-        let sections = sections(&apps, "");
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].title, USER_TITLE);
+    fn combines_search_and_group() {
+        let apps = sample();
+        let found = apps_for(&apps, InstallKind::User, "bra");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "brave");
     }
 
     #[test]
-    fn no_match_means_no_sections() {
-        let sections = sections(&sample(), "nao-existe");
-        assert!(sections.is_empty());
+    fn no_match_means_empty() {
+        assert!(apps_for(&sample(), InstallKind::User, "firefox").is_empty());
     }
 
     #[test]

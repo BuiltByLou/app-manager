@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::dpkg::{InstalledPackage, parse_apt_mark_manual, parse_dpkg_query};
+use crate::dpkg::{InstalledPackage, parse_apt_mark_manual, parse_auto_installed, parse_dpkg_query};
 use crate::flatpak::{FlatpakApp, parse_flatpak_list};
 use crate::inventory::{DesktopFile, SystemProbe};
 
@@ -59,9 +59,31 @@ impl SystemProbe for RealProbe {
     }
 
     fn manual_packages(&self) -> HashSet<String> {
-        run(Command::new("apt-mark").arg("showmanual"))
-            .map(|out| parse_apt_mark_manual(&out))
-            .unwrap_or_default()
+        let Ok(text) = std::fs::read_to_string("/var/lib/apt/extended_states") else {
+            return run(Command::new("apt-mark").arg("showmanual"))
+                .map(|out| parse_apt_mark_manual(&out))
+                .unwrap_or_default();
+        };
+        let auto = parse_auto_installed(&text);
+        self.packages()
+            .into_iter()
+            .map(|package| crate::dpkg::base_name(&package.name).to_owned())
+            .filter(|name| !auto.contains(name))
+            .collect()
+    }
+
+    fn desktop_packages(&self) -> HashSet<String> {
+        ["pop-desktop", "cosmic-session", "ubuntu-desktop"]
+            .iter()
+            .filter_map(|metapackage| {
+                run(Command::new("dpkg-query").args([
+                    "-W",
+                    "-f=${Depends}\n${Recommends}",
+                    metapackage,
+                ]))
+            })
+            .flat_map(|out| crate::dpkg::parse_relations(&out))
+            .collect()
     }
 
     fn package_owners(&self, paths: &[PathBuf]) -> HashMap<PathBuf, String> {

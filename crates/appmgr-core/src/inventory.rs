@@ -43,6 +43,8 @@ pub trait SystemProbe {
     fn desktop_files(&self) -> Vec<DesktopFile>;
     fn packages(&self) -> Vec<InstalledPackage>;
     fn manual_packages(&self) -> HashSet<String>;
+    /// Pacotes que compõem o desktop (dependências diretas dos metapacotes).
+    fn desktop_packages(&self) -> HashSet<String>;
     /// Pacotes donos de caminhos (`dpkg -S`), resolvidos numa só chamada.
     fn package_owners(&self, paths: &[PathBuf]) -> HashMap<PathBuf, String>;
     /// Caminho absoluto de um programa, resolvendo nomes simples pelo `PATH`.
@@ -56,6 +58,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
     let by_name: HashMap<&str, &InstalledPackage> =
         packages.iter().map(|p| (p.name.as_str(), p)).collect();
     let manual = probe.manual_packages();
+    let desktop = probe.desktop_packages();
 
     let mut apps = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -143,7 +146,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             version: Some(package.version.clone()),
             icon: entry.icon,
             origin: Origin::Apt,
-            kind: if is_system_package(package, &manual) {
+            kind: if is_system_package(package, &manual, &desktop) {
                 InstallKind::System
             } else {
                 InstallKind::User
@@ -171,9 +174,17 @@ fn exec_program(exec: &str) -> &str {
         .trim_matches('"')
 }
 
-fn is_system_package(package: &InstalledPackage, manual: &HashSet<String>) -> bool {
+fn is_system_package(
+    package: &InstalledPackage,
+    manual: &HashSet<String>,
+    desktop: &HashSet<String>,
+) -> bool {
     let protected_priority = matches!(package.priority.as_str(), "required" | "important");
-    package.essential || protected_priority || !manual.contains(&package.name)
+    let name = crate::dpkg::base_name(&package.name);
+    package.essential
+        || protected_priority
+        || desktop.contains(name)
+        || !manual.contains(name)
 }
 
 fn is_flatpak_entry(entry: &DesktopEntry) -> bool {
@@ -194,6 +205,7 @@ mod tests {
         desktops: Vec<DesktopFile>,
         packages: Vec<InstalledPackage>,
         manual: HashSet<String>,
+        desktop: HashSet<String>,
         owners: HashMap<String, String>,
         programs: HashMap<String, PathBuf>,
         flatpaks: Vec<FlatpakApp>,
@@ -217,6 +229,10 @@ mod tests {
 
         fn manual_packages(&self) -> HashSet<String> {
             self.manual.clone()
+        }
+
+        fn desktop_packages(&self) -> HashSet<String> {
+            self.desktop.clone()
         }
 
         fn package_owners(&self, paths: &[PathBuf]) -> HashMap<PathBuf, String> {
@@ -283,6 +299,7 @@ mod tests {
                 "gimp".to_owned(),
                 "gnome-terminal".to_owned(),
             ]),
+            desktop: HashSet::new(),
             owners: HashMap::from([
                 ("/usr/lib/firefox/firefox".to_owned(), "firefox".to_owned()),
                 ("/usr/bin/gimp".to_owned(), "gimp".to_owned()),
@@ -388,6 +405,30 @@ mod tests {
         system.desktops.push(desktop("Fantasma", "fantasma %F"));
         let apps = build_inventory(&system);
         assert!(apps.iter().all(|a| a.name != "Fantasma"));
+    }
+
+    #[test]
+    fn treats_desktop_meta_packages_as_system_even_when_manual() {
+        let mut system = fake();
+        system.desktops.push(desktop(
+            "COSMIC Terminal",
+            "/usr/bin/cosmic-term",
+        ));
+        system
+            .owners
+            .insert("/usr/bin/cosmic-term".to_owned(), "cosmic-term".to_owned());
+        system
+            .packages
+            .push(package("cosmic-term", "1.11.0", "optional", false));
+        system.manual.insert("cosmic-term".to_owned());
+        system.desktop.insert("cosmic-term".to_owned());
+
+        let apps = build_inventory(&system);
+        let terminal = apps
+            .iter()
+            .find(|a| a.name == "COSMIC Terminal")
+            .expect("terminal");
+        assert_eq!(terminal.kind, InstallKind::System);
     }
 
     #[test]
