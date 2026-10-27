@@ -1,22 +1,18 @@
 use appmgr_core::inventory::{App, InstallKind};
 
-pub const USER_TITLE: &str = "Instaladas por mim";
-pub const SYSTEM_TITLE: &str = "Sistema";
-pub const MAINTAINER_TITLE: &str = "Manutenção";
-
-pub const PROTECTED_TITLE: &str = "Protegidas";
-pub const PROTECTED_CAPTION: &str = "Fazem parte do sistema; remover pode parti-lo.";
-pub const REMOVABLE_TITLE: &str = "Removíveis";
-pub const REMOVABLE_CAPTION: &str = "Instaladas pelo sistema, mas seguras de remover.";
-
-/// Um conjunto de apps com título próprio dentro de uma página.
+/// A set of apps with its own heading inside a page.
 pub struct Group {
-    pub title: &'static str,
-    pub caption: &'static str,
+    pub kind: GroupKind,
     pub apps: Vec<App>,
 }
 
-/// Filtra por nome ou pacote, sem distinguir maiúsculas de minúsculas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKind {
+    Protected,
+    Removable,
+}
+
+/// Filters by name or package, ignoring case.
 pub fn filter<'a>(apps: &'a [App], query: &str) -> Vec<&'a App> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
@@ -33,7 +29,7 @@ pub fn filter<'a>(apps: &'a [App], query: &str) -> Vec<&'a App> {
         .collect()
 }
 
-/// Apps de um só grupo, filtradas e por ordem alfabética.
+/// Apps of a single kind, filtered and sorted alphabetically.
 pub fn apps_for(apps: &[App], kind: InstallKind, query: &str) -> Vec<App> {
     let mut matching: Vec<App> = filter(apps, query)
         .into_iter()
@@ -44,7 +40,7 @@ pub fn apps_for(apps: &[App], kind: InstallKind, query: &str) -> Vec<App> {
     matching
 }
 
-/// As apps do sistema, separadas entre protegidas e removíveis.
+/// The system apps, split between protected and removable.
 pub fn system_groups(apps: &[App], query: &str) -> Vec<Group> {
     let (protected, removable): (Vec<App>, Vec<App>) = apps_for(apps, InstallKind::System, query)
         .into_iter()
@@ -53,22 +49,20 @@ pub fn system_groups(apps: &[App], query: &str) -> Vec<Group> {
     let mut groups = Vec::new();
     if !protected.is_empty() {
         groups.push(Group {
-            title: PROTECTED_TITLE,
-            caption: PROTECTED_CAPTION,
+            kind: GroupKind::Protected,
             apps: protected,
         });
     }
     if !removable.is_empty() {
         groups.push(Group {
-            title: REMOVABLE_TITLE,
-            caption: REMOVABLE_CAPTION,
+            kind: GroupKind::Removable,
             apps: removable,
         });
     }
     groups
 }
 
-/// Tamanho legível: "512 B", "12 kB", "58.2 MB", "1.4 GB".
+/// Human-readable size: "512 B", "12 kB", "58.2 MB", "1.4 GB".
 pub fn format_size(bytes: u64) -> String {
     match bytes {
         0..1_000 => format!("{bytes} B"),
@@ -163,9 +157,9 @@ mod tests {
     fn separates_protected_system_apps_from_the_rest() {
         let groups = system_groups(&sample(), "");
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].title, PROTECTED_TITLE);
+        assert_eq!(groups[0].kind, GroupKind::Protected);
         assert_eq!(groups[0].apps[0].name, "COSMIC Store");
-        assert_eq!(groups[1].title, REMOVABLE_TITLE);
+        assert_eq!(groups[1].kind, GroupKind::Removable);
         assert_eq!(groups[1].apps[0].name, "Firefox");
     }
 
@@ -174,14 +168,15 @@ mod tests {
         let apps = vec![app_with("COSMIC Store", InstallKind::System, true)];
         let groups = system_groups(&apps, "");
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].title, PROTECTED_TITLE);
+        assert_eq!(groups[0].kind, GroupKind::Protected);
     }
 
     #[test]
     fn search_applies_to_both_system_groups() {
         let apps = sample();
-        assert!(system_groups(&apps, "firefox").len() == 1);
-        assert_eq!(system_groups(&apps, "firefox")[0].title, REMOVABLE_TITLE);
+        let groups = system_groups(&apps, "firefox");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::Removable);
     }
 
     #[test]

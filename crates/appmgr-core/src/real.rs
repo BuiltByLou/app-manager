@@ -18,6 +18,25 @@ impl RealProbe {
             .unwrap_or_default();
         Self { home }
     }
+
+    /// Runs `apt-get -s remove` and returns what apt says, stdout and stderr.
+    /// It changes nothing: the `-s` flag only simulates.
+    pub fn simulate_apt_remove(&self, package: &str) -> String {
+        let output = Command::new("apt-get")
+            .args(["-s", "remove", package])
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .output();
+
+        match output {
+            Ok(output) => {
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                text
+            }
+            Err(error) => format!("E: could not run apt-get: {error}"),
+        }
+    }
 }
 
 impl SystemProbe for RealProbe {
@@ -236,5 +255,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn real_apt_simulation_answers_without_touching_the_system() {
+        let probe = RealProbe::new();
+        let apps = build_inventory(&probe);
+        let Some(package) = apps
+            .iter()
+            .find(|a| a.origin == Origin::Apt && !a.protected)
+            .and_then(|a| a.package.clone())
+        else {
+            return;
+        };
+
+        let text = probe.simulate_apt_remove(&package);
+        assert!(!text.trim().is_empty(), "apt-get não respondeu");
+        assert!(
+            text.contains("simulation") || text.contains("REMOVED") || text.contains("E: "),
+            "saída inesperada do apt-get: {text}"
+        );
     }
 }

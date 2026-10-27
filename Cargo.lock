@@ -183,7 +183,10 @@ name = "appmgr"
 version = "0.1.0"
 dependencies = [
  "appmgr-core",
+ "i18n-embed",
+ "i18n-embed-fl",
  "libcosmic",
+ "rust-embed",
 ]
 
 [[package]]

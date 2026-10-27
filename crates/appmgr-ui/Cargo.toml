@@ -7,4 +7,7 @@ description = "Gestor de apps para Linux"
 
 [dependencies]
 appmgr-core = { path = "../appmgr-core" }
+i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10"
 libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["winit", "wayland", "x11", "tokio"] }
+rust-embed = "8"

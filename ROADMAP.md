@@ -17,8 +17,8 @@
 
 | Fase | Nome | Estado |
 |------|------|--------|
-| 0 | Fundação: inventário read-only | Em curso (UI pronta; falta decidir o tratamento das apps de sistema) |
-| 1 | Remoção segura | Por começar |
+| 0 | Fundação: inventário read-only | Concluída (inventário em 266 ms, interface em inglês) |
+| 1 | Remoção segura | Em curso (pré-visualização real com `apt-get -s`; falta executar) |
 | 2 | Instalação a partir do GitHub | Por começar |
 | 3 | Atualizações | Por começar |
 | 4 | Publicação | Por começar |
@@ -163,3 +163,5 @@ A fase 0 é obrigatória para tudo. A fase 1 não depende da 2; a 2 não depende
 | 2026-10-27 | Fase 0: menu lateral com Instaladas por mim / Sistema / Manutenção. | 0 |
 | 2026-10-27 | Fase 0: classificação passou a ler `extended_states` e as dependências do desktop localmente; inventário em 266 ms. `cosmic-term` (recommend do `cosmic-session`) passa a sistema. | 0 |
 | 2026-10-27 | Fase 0 (D7): separador Sistema dividido em Protegidas e Removíveis, com cadeado nas protegidas. Corrigida a leitura de relações multi-linha (`cosmic-edit`). | 0 |
+| 2026-10-27 | Fase 0 (D8): interface passou a inglês com Fluent (`i18n/en/app_manager.ftl`); pronta para novos idiomas com fallback. | 0 |
+| 2026-10-27 | Fase 1 (D9): linhas selecionáveis, painel de detalhe e pré-visualização de remoção com `apt-get -s`; bibliotecas partilhadas e órfãs ficam instaladas. Nada é executado. | 1 |

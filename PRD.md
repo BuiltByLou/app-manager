@@ -167,6 +167,8 @@ Prioridade: **M** = obrigatório na v1 · **S** = desejável · **C** = futuro.
 | D5 | Nome do produto | "App Manager" é provisório | A decidir antes da fase 4 |
 | D6 | Distros | Só apt vs. multi-distro | Só apt na v1, backend abstrato |
 | D7 | Apps de sistema na interface | Tudo numa lista vs. separar protegidas | **Separar em "Protegidas" e "Removíveis"**; protegidas sem ação de remover |
+| D8 | Idioma da interface | Só inglês vs. traduzido | **Inglês como origem e fallback**, Fluent, estrutura pronta para traduções |
+| D9 | Dependências na remoção | Remover órfãs automaticamente vs. deixar | **Deixar tudo o que não é a app**; bibliotecas partilhadas e órfãs ficam, nada de `autoremove` silencioso |
 
 ## 12. Riscos
 
