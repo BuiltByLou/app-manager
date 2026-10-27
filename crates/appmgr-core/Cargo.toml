@@ -1,0 +1,6 @@
+[package]
+name = "appmgr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inventário e remoção de apps para o App Manager"

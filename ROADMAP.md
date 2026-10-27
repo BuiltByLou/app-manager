@@ -17,7 +17,7 @@
 
 | Fase | Nome | Estado |
 |------|------|--------|
-| 0 | Fundação: inventário read-only | Por começar |
+| 0 | Fundação: inventário read-only | Em curso (motor pronto, falta UI) |
 | 1 | Remoção segura | Por começar |
 | 2 | Instalação a partir do GitHub | Por começar |
 | 3 | Atualizações | Por começar |
@@ -158,3 +158,4 @@ A fase 0 é obrigatória para tudo. A fase 1 não depende da 2; a 2 não depende
 | Data | Alteração | Fase |
 |------|-----------|------|
 | 2026-10-27 | Criação do documento, fases 0–4 propostas | — |
+| 2026-10-27 | Fase 0: motor de inventário (apt, Flatpak, AppImage) com 23 testes. Corrigido mapeamento de pacotes (nomes simples e `/bin`→`/usr/bin`). Inventário em 445 ms. | 0 |
