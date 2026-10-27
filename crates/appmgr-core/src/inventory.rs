@@ -28,6 +28,8 @@ pub struct App {
     pub icon: Option<String>,
     pub origin: Origin,
     pub kind: InstallKind,
+    /// Não deve ser removida: é essencial ou faz parte do desktop.
+    pub protected: bool,
     pub size_bytes: u64,
     pub package: Option<String>,
 }
@@ -80,6 +82,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             } else {
                 InstallKind::System
             },
+            protected: false,
             size_bytes: flatpak.size_bytes,
             package: Some(flatpak.id),
         });
@@ -101,6 +104,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             icon: None,
             origin: Origin::AppImage,
             kind: InstallKind::User,
+            protected: false,
             size_bytes: 0,
             package: None,
         });
@@ -151,6 +155,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             } else {
                 InstallKind::User
             },
+            protected: is_protected(package, &desktop),
             size_bytes: package.installed_size_kib * 1024,
             package: Some(package.name.clone()),
         });
@@ -179,12 +184,14 @@ fn is_system_package(
     manual: &HashSet<String>,
     desktop: &HashSet<String>,
 ) -> bool {
+    is_protected(package, desktop) || !manual.contains(crate::dpkg::base_name(&package.name))
+}
+
+/// Essencial, de prioridade alta ou parte do desktop: nunca remover.
+fn is_protected(package: &InstalledPackage, desktop: &HashSet<String>) -> bool {
     let protected_priority = matches!(package.priority.as_str(), "required" | "important");
     let name = crate::dpkg::base_name(&package.name);
-    package.essential
-        || protected_priority
-        || desktop.contains(name)
-        || !manual.contains(name)
+    package.essential || protected_priority || desktop.contains(name)
 }
 
 fn is_flatpak_entry(entry: &DesktopEntry) -> bool {
@@ -345,6 +352,7 @@ mod tests {
         let apps = build_inventory(&fake());
         let terminal = apps.iter().find(|a| a.name == "Terminal").unwrap();
         assert_eq!(terminal.kind, InstallKind::System);
+        assert!(terminal.protected);
     }
 
     #[test]
@@ -352,6 +360,14 @@ mod tests {
         let apps = build_inventory(&fake());
         let software = apps.iter().find(|a| a.name == "Software").unwrap();
         assert_eq!(software.kind, InstallKind::System);
+        assert!(!software.protected, "auto-instalada mas removível");
+    }
+
+    #[test]
+    fn user_apps_are_not_protected() {
+        let apps = build_inventory(&fake());
+        let firefox = apps.iter().find(|a| a.name == "Firefox").unwrap();
+        assert!(!firefox.protected);
     }
 
     #[test]
@@ -429,6 +445,7 @@ mod tests {
             .find(|a| a.name == "COSMIC Terminal")
             .expect("terminal");
         assert_eq!(terminal.kind, InstallKind::System);
+        assert!(terminal.protected, "recommend do desktop");
     }
 
     #[test]

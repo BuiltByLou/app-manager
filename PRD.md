@@ -166,6 +166,7 @@ Prioridade: **M** = obrigatório na v1 · **S** = desejável · **C** = futuro.
 | D4 | Flatpak | Só gerir vs. instalar também | Só gerir na v1 |
 | D5 | Nome do produto | "App Manager" é provisório | A decidir antes da fase 4 |
 | D6 | Distros | Só apt vs. multi-distro | Só apt na v1, backend abstrato |
+| D7 | Apps de sistema na interface | Tudo numa lista vs. separar protegidas | **Separar em "Protegidas" e "Removíveis"**; protegidas sem ação de remover |
 
 ## 12. Riscos
 

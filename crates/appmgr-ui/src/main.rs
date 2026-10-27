@@ -7,7 +7,7 @@ use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
 use appmgr_core::real::RealProbe;
-use view_model::{format_size, apps_for};
+use view_model::{Group, apps_for, format_size, system_groups};
 
 const APP_ID: &str = "io.github.builtbylou.app_manager";
 
@@ -173,21 +173,25 @@ impl AppManager {
             return centred("A ler as apps instaladas…");
         }
 
-        let Some(kind) = page.kind() else {
-            return centred(
+        match page {
+            Page::Maintainer => centred(
                 "Instalar e atualizar apps a partir de um repositório GitHub \
                  é a próxima fase. Por agora, usa as apps instaladas.",
-            );
-        };
+            ),
+            Page::User => {
+                let apps = apps_for(&self.apps, InstallKind::User, &self.query);
+                self.list_page(apps)
+            }
+            Page::System => {
+                let groups = system_groups(&self.apps, &self.query);
+                self.system_page(groups)
+            }
+        }
+    }
 
-        let apps = apps_for(&self.apps, kind, &self.query);
+    fn list_page(&self, apps: Vec<InstalledApp>) -> Element<'_, Message> {
         if apps.is_empty() {
-            let message = if self.query.trim().is_empty() {
-                "Nenhuma app neste grupo."
-            } else {
-                "Nada corresponde à pesquisa."
-            };
-            return centred(message);
+            return centred(self.empty_message());
         }
 
         let mut list = widget::column![].spacing(4);
@@ -197,6 +201,35 @@ impl AppManager {
         }
 
         scrollable(list).height(Length::Fill).into()
+    }
+
+    fn system_page(&self, groups: Vec<Group>) -> Element<'_, Message> {
+        if groups.is_empty() {
+            return centred(self.empty_message());
+        }
+
+        let mut list = widget::column![].spacing(4);
+        for group in groups {
+            list = list.push(text::title3(group.title));
+            list = list.push(text::caption(format!(
+                "{} · {} apps",
+                group.caption,
+                group.apps.len()
+            )));
+            for app in &group.apps {
+                list = list.push(app_row(app));
+            }
+        }
+
+        scrollable(list).height(Length::Fill).into()
+    }
+
+    fn empty_message(&self) -> &'static str {
+        if self.query.trim().is_empty() {
+            "Nenhuma app neste grupo."
+        } else {
+            "Nada corresponde à pesquisa."
+        }
     }
 }
 
@@ -235,10 +268,12 @@ fn app_row(app: &InstalledApp) -> Element<'static, Message> {
         .spacing(2)
         .width(Length::Fill);
 
-    container(widget::row![icon, labels].spacing(12).align_y(Alignment::Center))
-        .padding(8)
-        .width(Length::Fill)
-        .into()
+    let mut row = widget::row![icon, labels].spacing(12).align_y(Alignment::Center);
+    if app.protected {
+        row = row.push(widget::icon::from_name("changes-prevent-symbolic").size(16));
+    }
+
+    container(row).padding(8).width(Length::Fill).into()
 }
 
 fn origin_label(origin: Origin) -> &'static str {

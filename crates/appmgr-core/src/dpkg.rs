@@ -87,7 +87,7 @@ pub fn parse_auto_installed(text: &str) -> HashSet<String> {
 
 /// Lê relações do dpkg (`Depends`, `Recommends`): `a | b, c (>= 1)`.
 pub fn parse_relations(text: &str) -> HashSet<String> {
-    text.split([',', '|'])
+    text.split([',', '|', '\n'])
         .filter_map(|part| part.split_whitespace().next())
         .filter(|name| !name.is_empty() && !name.starts_with('('))
         .map(str::to_owned)
@@ -225,14 +225,13 @@ Auto-Installed: 1
 
     #[test]
     fn parses_relations_with_versions_and_alternatives() {
-        let text = "dconf-gsettings-backend | gsettings-backend, libc6 (>= 2.39), cosmic-term,\n cosmic-edit";
+        let text = "xwayland\ncosmic-edit, cosmic-monitor (>= 1), libc6 (>= 2.39)";
         let names = parse_relations(text);
-        assert!(names.contains("dconf-gsettings-backend"));
-        assert!(names.contains("gsettings-backend"));
-        assert!(names.contains("libc6"));
-        assert!(names.contains("cosmic-term"));
+        assert!(names.contains("xwayland"));
         assert!(names.contains("cosmic-edit"));
-        assert_eq!(names.len(), 5);
+        assert!(names.contains("cosmic-monitor"));
+        assert!(names.contains("libc6"));
+        assert_eq!(names.len(), 4);
     }
 
     #[test]

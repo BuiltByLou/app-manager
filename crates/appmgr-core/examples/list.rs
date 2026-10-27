@@ -15,6 +15,7 @@ fn main() {
     for app in &apps {
         let kind = match app.kind {
             InstallKind::User => "user",
+            InstallKind::System if app.protected => "sys*",
             InstallKind::System => "sys ",
         };
         let origin = match app.origin {

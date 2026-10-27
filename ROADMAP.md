@@ -162,3 +162,4 @@ A fase 0 é obrigatória para tudo. A fase 1 não depende da 2; a 2 não depende
 | 2026-10-27 | Fase 0: janela libcosmic com pesquisa, secções e atualização manual; 8 testes de apresentação. | 0 |
 | 2026-10-27 | Fase 0: menu lateral com Instaladas por mim / Sistema / Manutenção. | 0 |
 | 2026-10-27 | Fase 0: classificação passou a ler `extended_states` e as dependências do desktop localmente; inventário em 266 ms. `cosmic-term` (recommend do `cosmic-session`) passa a sistema. | 0 |
+| 2026-10-27 | Fase 0 (D7): separador Sistema dividido em Protegidas e Removíveis, com cadeado nas protegidas. Corrigida a leitura de relações multi-linha (`cosmic-edit`). | 0 |
