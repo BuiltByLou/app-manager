@@ -77,3 +77,7 @@ remove-running-note = You can close this window; the removal continues in the ba
 remove-failed = The removal failed:
 remove-refused = The system refused this removal:
 remove-close = Close
+leftovers-title = Leftover files
+leftovers-body = These files might be left behind. Send them to the trash?
+leftovers-trash = Move to trash
+leftovers-skip = Keep them

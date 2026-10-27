@@ -8,6 +8,7 @@ use cosmic::widget::{self, button, container, nav_bar, scrollable, text};
 use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
+use appmgr_core::leftovers::{Leftover, append_history, find_leftovers, trash_path};
 use appmgr_core::real::RealProbe;
 use appmgr_core::removal::{
     RemovalPlan, authorize, is_authorized, keep_sudo_alive, plan_for, removal_command, run_removal,
@@ -76,6 +77,9 @@ enum Dialog {
         plan: RemovalPlan,
     },
     Running,
+    Leftovers {
+        items: Vec<Leftover>,
+    },
     Failed {
         error: String,
     },
@@ -115,6 +119,8 @@ pub enum Message {
         app: InstalledApp,
         result: Result<(), String>,
     },
+    TrashLeftovers,
+    LeftoversTrashed,
     SetConfirmRemovals(bool),
 }
 
@@ -420,8 +426,20 @@ impl Application for AppManager {
             }
             Message::Removed { app, result } => match result {
                 Ok(()) => {
-                    if matches!(self.dialog, Some(Dialog::Running)) {
-                        self.dialog = None;
+                    append_history(
+                        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).as_path(),
+                        &app.name,
+                        &format!("{:?}", app.origin),
+                        "removed",
+                    );
+                    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+                    let items = find_leftovers(&app, &home);
+                    if items.is_empty() {
+                        if matches!(self.dialog, Some(Dialog::Running)) {
+                            self.dialog = None;
+                        }
+                    } else {
+                        self.dialog = Some(Dialog::Leftovers { items });
                     }
                     if self.selected.as_deref() == Some(app.id.as_str()) {
                         self.selected = None;
@@ -448,6 +466,24 @@ impl Application for AppManager {
                     Task::none()
                 }
             },
+            Message::TrashLeftovers => {
+                let Some(Dialog::Leftovers { items }) = self.dialog.take() else {
+                    return Task::none();
+                };
+                self.dialog = Some(Dialog::Running);
+                Task::perform(
+                    async move {
+                        for item in &items {
+                            let _ = trash_path(&item.path);
+                        }
+                    },
+                    |_| cosmic::Action::App(Message::LeftoversTrashed),
+                )
+            }
+            Message::LeftoversTrashed => {
+                self.dialog = None;
+                Task::none()
+            }
             Message::SetConfirmRemovals(confirm) => {
                 self.set_confirm_removals(confirm);
                 Task::none()
@@ -757,6 +793,23 @@ impl AppManager {
                     .control(text::caption(fl!("remove-running-note")))
                     .secondary_action(
                         button::standard(fl!("remove-close")).on_press(Message::CancelDialog),
+                    );
+            }
+            Dialog::Leftovers { items } => {
+                let mut list = widget::column![].spacing(2);
+                for item in items {
+                    list = list.push(text::caption(item.path.clone()));
+                }
+                window = window
+                    .body(fl!("leftovers-title"))
+                    .control(text::caption(fl!("leftovers-body")))
+                    .control(scrollable(list).height(Length::Fixed(220.0)))
+                    .primary_action(
+                        button::destructive(fl!("leftovers-trash"))
+                            .on_press(Message::TrashLeftovers),
+                    )
+                    .secondary_action(
+                        button::standard(fl!("leftovers-skip")).on_press(Message::CancelDialog),
                     );
             }
             Dialog::Failed { error } => {
