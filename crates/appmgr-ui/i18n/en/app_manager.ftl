@@ -13,6 +13,11 @@ refreshing = Reading…
 
 loading-apps = Reading installed apps…
 maintainer-soon = Installing and updating apps from a GitHub repository is the next phase. For now, use the installed apps.
+maint-url-placeholder = https://github.com/owner/repo
+maint-load = Load latest release
+maint-loading = Loading…
+maint-install = Install
+maint-release = Release
 
 apps-count = { $count ->
     [one] { $count } app

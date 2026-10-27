@@ -18,8 +18,8 @@
 | Fase | Nome | Estado |
 |------|------|--------|
 | 0 | Fundação: inventário read-only | Concluída (inventário em 266 ms, interface em inglês) |
-| 1 | Remoção segura | Em curso (pré-visualização real, execução via sudo, deteção de vestígios e histórico) |
-| 2 | Instalação a partir do GitHub | Por começar |
+| 1 | Remoção segura | Concluída (pré-visualização real, execução via sudo, vestígios e histórico; matriz de testes nos crates) |
+| 2 | Instalação a partir do GitHub | Em curso (motor de parsing e release JSON; falta UI de instalação) |
 | 3 | Atualizações | Por começar |
 | 4 | Publicação | Por começar |
 

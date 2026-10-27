@@ -1,6 +1,8 @@
 pub mod desktop;
 pub mod dpkg;
 pub mod flatpak;
+pub mod github;
+pub mod install;
 pub mod inventory;
 pub mod leftovers;
 pub mod real;
