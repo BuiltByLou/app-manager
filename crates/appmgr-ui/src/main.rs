@@ -659,7 +659,8 @@ impl AppManager {
         let dialog = self.dialog.as_ref()?;
         let mut window = widget::dialog::dialog()
             .title(fl!("remove-title"))
-            .max_width(520.0);
+            .max_width(520.0)
+            .max_height(480.0);
 
         match dialog {
             Dialog::Auth {
@@ -812,7 +813,7 @@ impl AppManager {
 }
 
 fn plan_dialog<'a>(
-    mut window: widget::dialog::Dialog<'a, Message>,
+    window: widget::dialog::Dialog<'a, Message>,
     app: &InstalledApp,
     plan: &RemovalPlan,
 ) -> widget::dialog::Dialog<'a, Message> {
@@ -823,36 +824,33 @@ fn plan_dialog<'a>(
             .primary_action(button::standard(fl!("remove-close")).on_press(Message::CancelDialog));
     }
 
-    window = window
-        .body(fl!("remove-body", name = app.name.clone()))
-        .control(text::caption(fl!("remove-package")))
-        .control(text::body(plan.target.clone()));
-
+    let mut details = widget::column![text::caption(fl!("remove-package")), text::body(plan.target.clone())]
+        .spacing(4);
     if !plan.extra_packages.is_empty() {
-        window = window.control(text::caption(fl!("remove-extra")));
+        details = details.push(text::caption(fl!("remove-extra")));
         for package in &plan.extra_packages {
-            window = window.control(text::caption(package.clone()));
+            details = details.push(text::caption(package.clone()));
         }
     }
-
     if !plan.kept_orphans.is_empty() {
         let count = plan.kept_orphans.len() as i64;
-        window = window.control(text::caption(fl!("remove-kept", count = count)));
+        details = details.push(text::caption(fl!("remove-kept", count = count)));
     }
-
     match plan.origin {
         Origin::Apt => {
-            window = window.control(text::caption(fl!("remove-shared-libs")));
+            details = details.push(text::caption(fl!("remove-shared-libs")));
         }
         Origin::Flatpak => {
-            window = window.control(text::caption(fl!("remove-flatpak-note")));
+            details = details.push(text::caption(fl!("remove-flatpak-note")));
         }
         Origin::AppImage => {
-            window = window.control(text::caption(fl!("remove-appimage-note")));
+            details = details.push(text::caption(fl!("remove-appimage-note")));
         }
     }
 
     window
+        .body(fl!("remove-body", name = app.name.clone()))
+        .control(scrollable(details).height(Length::Fixed(220.0)))
         .primary_action(button::destructive(fl!("remove-confirm")).on_press(Message::ConfirmPlan))
         .secondary_action(button::standard(fl!("remove-cancel")).on_press(Message::CancelDialog))
 }
