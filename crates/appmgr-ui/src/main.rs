@@ -931,20 +931,43 @@ impl AppManager {
 
         if let Some(release) = &self.maint_release {
             content = content.push(text::title3(format!("Release {}", release.tag)));
+            // Build a card per compatible asset group.
+            let mut card = widget::column![].spacing(8).align_x(Alignment::Center);
+            card = card.push(widget::icon::from_name("application-x-executable").size(48));
+            // Derive a display name from the repo URL.
+            let name = self
+                .maint_url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("App")
+                .to_owned();
+            card = card.push(text::title3(name));
+            card = card.push(text::caption(release.tag.clone()));
+
+            let mut buttons = widget::row![].spacing(8);
             for asset in &release.assets {
-                if !is_compatible(asset) { continue; }
-                let label = format!("{} ({:.1} MB)", asset.name, asset.size as f64 / 1_000_000.0);
-                let install = match asset.kind {
-                    AssetKind::Deb => Some(Message::InstallAsset(AssetKind::Deb)),
-                    AssetKind::AppImage => Some(Message::InstallAsset(AssetKind::AppImage)),
-                    AssetKind::Other => None,
-                };
-                let mut row = widget::row![text::body(label)].spacing(8);
-                if let Some(msg) = install {
-                    row = row.push(button::standard(fl!("maint-install")).on_press(msg));
+                if !is_compatible(asset) {
+                    continue;
                 }
-                content = content.push(row);
+                let label = match asset.kind {
+                    AssetKind::Deb => "Install .deb".to_owned(),
+                    AssetKind::AppImage => "Install .AppImage".to_owned(),
+                    AssetKind::Other => continue,
+                };
+                buttons = buttons.push(
+                    button::standard(label).on_press(match asset.kind {
+                        AssetKind::Deb => Message::InstallAsset(AssetKind::Deb),
+                        AssetKind::AppImage => Message::InstallAsset(AssetKind::AppImage),
+                        AssetKind::Other => Message::InstallAsset(AssetKind::Other),
+                    }),
+                );
             }
+            card = card.push(buttons);
+            content = content.push(
+                container(card.padding(16))
+                    .width(Length::Fixed(220.0)),
+            );
         }
 
         container(content.padding(20).width(Length::Fill).height(Length::Fill)).into()
