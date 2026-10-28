@@ -9,7 +9,7 @@ use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
 use appmgr_core::leftovers::{Leftover, append_history, find_leftovers, trash_path};
-use appmgr_core::github::{AssetKind, Repo, Release, fetch_latest, pick_asset};
+use appmgr_core::github::{AssetKind, Repo, Release, fetch_latest, pick_asset, is_compatible};
 use appmgr_core::real::RealProbe;
 use appmgr_core::install::{applications_dir, download, downloads_dir, install_appimage, install_deb};
 use appmgr_core::removal::{
@@ -932,6 +932,7 @@ impl AppManager {
         if let Some(release) = &self.maint_release {
             content = content.push(text::title3(format!("Release {}", release.tag)));
             for asset in &release.assets {
+                if !is_compatible(asset) { continue; }
                 let label = format!("{} ({:.1} MB)", asset.name, asset.size as f64 / 1_000_000.0);
                 let install = match asset.kind {
                     AssetKind::Deb => Some(Message::InstallAsset(AssetKind::Deb)),
