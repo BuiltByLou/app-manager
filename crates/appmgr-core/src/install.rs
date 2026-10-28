@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 pub fn download(url: &str, destination: &Path) -> Result<(), String> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)
@@ -46,7 +45,105 @@ pub fn install_appimage(source: &Path, destination: &Path) -> Result<(), String>
         std::fs::set_permissions(destination, permissions)
             .map_err(|error| format!("could not make the AppImage executable: {error}"))?;
     }
+
+    let stem = destination
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app")
+        .to_owned();
+
+    // Extract an icon from the AppImage so it shows up in the launcher.
+    let tmp = std::env::temp_dir().join(format!("appmgr-extract-{}", stem));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+    let extract_ok = std::process::Command::new(destination)
+        .arg("--appimage-extract")
+        .current_dir(&tmp)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let icons_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".local/share/icons");
+    let _ = std::fs::create_dir_all(&icons_dir);
+
+    let mut icon_ref = "application-x-executable".to_owned();
+    if extract_ok {
+        let root = tmp.join("squashfs-root");
+        // Prefer .DirIcon
+        let diricon = root.join(".DirIcon");
+        let mut icon_src: Option<PathBuf> = if diricon.exists() {
+            Some(diricon)
+        } else {
+            // Find the largest png/svg/xpm icon.
+            let mut best: Option<(u64, PathBuf)> = None;
+            for entry in walkdir(&root) {
+                let ext = entry
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ext != "png" && ext != "svg" && ext != "xpm" {
+                    continue;
+                }
+                if let Ok(meta) = std::fs::metadata(&entry) {
+                    if best.as_ref().map(|(s, _)| meta.len() > *s).unwrap_or(true) {
+                        best = Some((meta.len(), entry));
+                    }
+                }
+            }
+            best.map(|(_, p)| p)
+        };
+        if let Some(src) = icon_src.take() {
+            let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+            let dest_icon = icons_dir.join(format!("{}.{}", stem, ext));
+            if std::fs::copy(&src, &dest_icon).is_ok() {
+                icon_ref = stem.clone();
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Create a .desktop entry so the app shows up in the launcher.
+    let desktop_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".local/share/applications");
+    let _ = std::fs::create_dir_all(&desktop_dir);
+    let desktop_path = desktop_dir.join(format!("{}.desktop", stem));
+    let desktop_content = format!(
+        "[Desktop Entry]\nType=Application\nName={}\nExec={}\nIcon={}\nCategories=Utility;\nTerminal=false\n",
+        stem, destination.display(), icon_ref
+    );
+    let _ = std::fs::write(&desktop_path, desktop_content);
+    // Refresh the desktop database if available.
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&desktop_dir)
+        .output();
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .arg(&icons_dir)
+        .output();
     Ok(())
+}
+
+fn walkdir(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn run_sudo(args: &[&str]) -> Result<(), String> {

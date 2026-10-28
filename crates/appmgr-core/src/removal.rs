@@ -196,7 +196,7 @@ impl RemovalCommand {
             RemovalCommand::Flatpak { id, user: true } => vec![
                 "flatpak".to_owned(),
                 "uninstall".to_owned(),
-                "--assume-yes".to_owned(),
+                "--assumeyes".to_owned(),
                 "--user".to_owned(),
                 id.clone(),
             ],
@@ -205,7 +205,7 @@ impl RemovalCommand {
                 "-n".to_owned(),
                 "flatpak".to_owned(),
                 "uninstall".to_owned(),
-                "--assume-yes".to_owned(),
+                "--assumeyes".to_owned(),
                 "--system".to_owned(),
                 id.clone(),
             ],
@@ -527,7 +527,7 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
             vec![
                 "flatpak",
                 "uninstall",
-                "--assume-yes",
+                "--assumeyes",
                 "--user",
                 "com.github.day",
             ]
@@ -547,7 +547,7 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
                 "-n",
                 "flatpak",
                 "uninstall",
-                "--assume-yes",
+                "--assumeyes",
                 "--system",
                 "com.github.day",
             ]
