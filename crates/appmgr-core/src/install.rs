@@ -28,6 +28,10 @@ pub fn install_deb(path: &Path) -> Result<(), String> {
     run_sudo(&["apt-get", "install", "-y", &path.to_string_lossy()])
 }
 
+pub fn install_flatpak(path: &Path) -> Result<(), String> {
+    run_sudo(&["flatpak", "install", "-y", &path.to_string_lossy()])
+}
+
 pub fn install_appimage(source: &Path, destination: &Path) -> Result<(), String> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)

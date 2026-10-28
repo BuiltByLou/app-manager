@@ -11,7 +11,7 @@ use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inv
 use appmgr_core::leftovers::{Leftover, append_history, find_leftovers, trash_path};
 use appmgr_core::github::{AssetKind, Repo, Release, fetch_latest, pick_asset, is_compatible};
 use appmgr_core::real::RealProbe;
-use appmgr_core::install::{applications_dir, download, downloads_dir, install_appimage, install_deb};
+use appmgr_core::install::{applications_dir, download, downloads_dir, install_appimage, install_deb, install_flatpak};
 use appmgr_core::removal::{
     RemovalPlan, authorize, is_authorized, keep_sudo_alive, plan_for, removal_command, run_removal,
 };
@@ -557,6 +557,10 @@ impl Application for AppManager {
                                 install_deb(&destination)?;
                                 Ok(format!("Installed {}", asset.name))
                             }
+                            AssetKind::Flatpak => {
+                                install_flatpak(&destination)?;
+                                Ok(format!("Installed {}", asset.name))
+                            }
                             AssetKind::AppImage => {
                                 let target = applications_dir().join(&asset.name);
                                 install_appimage(&destination, &target)?;
@@ -953,12 +957,14 @@ impl AppManager {
                 let label = match asset.kind {
                     AssetKind::Deb => "Install .deb".to_owned(),
                     AssetKind::AppImage => "Install .AppImage".to_owned(),
+                    AssetKind::Flatpak => "Install .flatpak".to_owned(),
                     AssetKind::Other => continue,
                 };
                 buttons = buttons.push(
                     button::standard(label).on_press(match asset.kind {
                         AssetKind::Deb => Message::InstallAsset(AssetKind::Deb),
                         AssetKind::AppImage => Message::InstallAsset(AssetKind::AppImage),
+                        AssetKind::Flatpak => Message::InstallAsset(AssetKind::Flatpak),
                         AssetKind::Other => Message::InstallAsset(AssetKind::Other),
                     }),
                 );

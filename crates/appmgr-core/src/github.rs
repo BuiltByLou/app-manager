@@ -63,6 +63,7 @@ fn is_safe_segment(value: &str) -> bool {
 pub enum AssetKind {
     Deb,
     AppImage,
+    Flatpak,
     Other,
 }
 
@@ -80,6 +81,8 @@ impl Asset {
             AssetKind::Deb
         } else if name.ends_with(".AppImage") || name.ends_with(".appimage") {
             AssetKind::AppImage
+        } else if name.ends_with(".flatpak") {
+            AssetKind::Flatpak
         } else {
             AssetKind::Other
         };
