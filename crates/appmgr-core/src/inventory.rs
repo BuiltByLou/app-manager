@@ -44,7 +44,9 @@ pub struct DesktopFile {
 pub trait SystemProbe {
     fn desktop_files(&self) -> Vec<DesktopFile>;
     fn packages(&self) -> Vec<InstalledPackage>;
-    fn manual_packages(&self) -> HashSet<String>;
+    /// Packages the user installed on purpose. Receives the package list so a
+    /// probe never has to ask `dpkg` twice.
+    fn manual_packages(&self, packages: &[InstalledPackage]) -> HashSet<String>;
     /// Pacotes que compõem o desktop (dependências diretas dos metapacotes).
     fn desktop_packages(&self) -> HashSet<String>;
     /// Pacotes donos de caminhos (`dpkg -S`), resolvidos numa só chamada.
@@ -59,7 +61,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
     let packages = probe.packages();
     let by_name: HashMap<&str, &InstalledPackage> =
         packages.iter().map(|p| (p.name.as_str(), p)).collect();
-    let manual = probe.manual_packages();
+    let manual = probe.manual_packages(&packages);
     let desktop = probe.desktop_packages();
 
     let mut apps = Vec::new();
@@ -234,7 +236,7 @@ mod tests {
             self.packages.clone()
         }
 
-        fn manual_packages(&self) -> HashSet<String> {
+        fn manual_packages(&self, _packages: &[InstalledPackage]) -> HashSet<String> {
             self.manual.clone()
         }
 

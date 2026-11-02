@@ -9,7 +9,16 @@ pub fn download(url: &str, destination: &Path) -> Result<(), String> {
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     }
     let output = std::process::Command::new("curl")
-        .args(["-fsSL", "-o", &destination.to_string_lossy(), url])
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "900",
+            "-o",
+            &destination.to_string_lossy(),
+            url,
+        ])
         .output()
         .map_err(|error| format!("could not run curl: {error}"))?;
     if !output.status.success() {
@@ -53,7 +62,7 @@ pub fn install_appimage(source: &Path, destination: &Path) -> Result<(), String>
         .to_owned();
 
     // Extract an icon from the AppImage so it shows up in the launcher.
-    let tmp = std::env::temp_dir().join(format!("appmgr-extract-{}", stem));
+    let tmp = cache_dir().join(format!("extract-{stem}"));
     let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::create_dir_all(&tmp);
     let extract_ok = std::process::Command::new(destination)
@@ -77,21 +86,26 @@ pub fn install_appimage(source: &Path, destination: &Path) -> Result<(), String>
         let mut icon_src: Option<PathBuf> = if diricon.exists() {
             Some(diricon)
         } else {
-            // Find the largest png/svg/xpm icon.
+            // Find the largest icon in the icon theme, or one sitting next to
+            // AppRun. Walking the whole tree would also pick up splash screens.
+            let theme_icons = root.join("usr/share/icons");
             let mut best: Option<(u64, PathBuf)> = None;
             for entry in walkdir(&root) {
+                if !entry.starts_with(&theme_icons) && entry.parent() != Some(root.as_path()) {
+                    continue;
+                }
                 let ext = entry
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
-                    .to_lowercase();
+                    .to_ascii_lowercase();
                 if ext != "png" && ext != "svg" && ext != "xpm" {
                     continue;
                 }
-                if let Ok(meta) = std::fs::metadata(&entry) {
-                    if best.as_ref().map(|(s, _)| meta.len() > *s).unwrap_or(true) {
-                        best = Some((meta.len(), entry));
-                    }
+                if let Ok(meta) = std::fs::metadata(&entry)
+                    && best.as_ref().map(|(s, _)| meta.len() > *s).unwrap_or(true)
+                {
+                    best = Some((meta.len(), entry));
                 }
             }
             best.map(|(_, p)| p)
@@ -167,9 +181,10 @@ fn run_sudo(args: &[&str]) -> Result<(), String> {
     }
 }
 
-pub fn downloads_dir() -> PathBuf {
+/// Where downloads wait until they are installed.
+pub fn cache_dir() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join("Downloads")
+    home.join(".cache/app-manager/downloads")
 }
 
 pub fn applications_dir() -> PathBuf {
@@ -182,9 +197,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn downloads_dir_is_under_home() {
-        let dir = downloads_dir();
-        assert!(dir.ends_with("Downloads"));
+    fn cache_dir_is_under_home() {
+        let dir = cache_dir();
+        assert!(dir.ends_with(".cache/app-manager/downloads"));
     }
 
     #[test]

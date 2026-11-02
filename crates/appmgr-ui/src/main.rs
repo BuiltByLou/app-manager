@@ -8,15 +8,17 @@ use cosmic::widget::{self, button, container, nav_bar, scrollable, text};
 use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
-use appmgr_core::leftovers::{Leftover, append_history, find_leftovers, trash_path};
-use appmgr_core::github::{AssetKind, Repo, Release, fetch_latest, pick_asset, is_compatible};
+use appmgr_core::leftovers::{Leftover, append_history, find_leftovers, trash_paths};
+use appmgr_core::github::{Asset, AssetKind, Repo, Release, fetch_latest, installable_assets};
 use appmgr_core::real::RealProbe;
-use appmgr_core::install::{applications_dir, download, downloads_dir, install_appimage, install_deb, install_flatpak};
+use appmgr_core::install::{
+    applications_dir, cache_dir, download, install_appimage, install_deb, install_flatpak,
+};
 use appmgr_core::removal::{
     RemovalPlan, authorize, is_authorized, keep_sudo_alive, plan_for, removal_command, run_removal,
 };
 use prefs::Preferences;
-use view_model::{Group, GroupKind, apps_for, filter, format_size, system_groups};
+use view_model::{Group, GroupKind, format_size, matching, protected_count, system_groups};
 
 const APP_ID: &str = "io.github.builtbylou.app_manager";
 
@@ -92,14 +94,15 @@ pub enum Message {
     Refresh,
     Loaded(Vec<InstalledApp>),
     Search(String),
-    OpenDetails(String),
-    Select(String),
+    /// Rows carry their index so the view never clones an id to build a message.
+    OpenDetails(usize),
+    Select(usize),
     CloseDetail,
     ToggleProtected,
-    OpenMenu(String),
+    OpenMenu(usize),
     CloseMenu,
-    StartQuickRemoval(String),
-    StartDetailedRemoval(String),
+    StartQuickRemoval(usize),
+    StartDetailedRemoval(usize),
     ToggleDontAsk(bool),
     ConfirmQuick,
     CancelDialog,
@@ -119,7 +122,7 @@ pub enum Message {
     SkipAuth,
     Removed {
         app: InstalledApp,
-        result: Result<(), String>,
+        result: Result<Vec<Leftover>, String>,
     },
     TrashLeftovers,
     LeftoversTrashed,
@@ -135,6 +138,15 @@ pub struct AppManager {
     core: Core,
     nav_model: nav_bar::Model,
     apps: Vec<InstalledApp>,
+    /// Subtitle and icon per app, resolved once when the inventory loads.
+    /// Rebuilding them on every redraw is what made long lists feel heavy.
+    subtitles: Vec<String>,
+    icons: Vec<widget::icon::Handle>,
+    /// Rows shown on each page, recomputed only when the inventory or the
+    /// search changes. Rows are indices into `apps`.
+    user_rows: Vec<usize>,
+    system_groups: Vec<Group>,
+    protected_total: usize,
     query: String,
     loading: bool,
     /// Id of the app whose row is highlighted.
@@ -156,12 +168,17 @@ pub struct AppManager {
     maint_url: String,
     maint_repo: Option<Repo>,
     maint_release: Option<Release>,
+    /// Installable assets of `maint_release`, filtered once when it loads.
+    maint_assets: Vec<Asset>,
     maint_status: String,
     maint_working: bool,
 }
 
 impl Application for AppManager {
-    type Executor = cosmic::SingleThreadExecutor;
+    /// Tasks here spawn processes that block (dpkg, apt, curl, gio). A
+    /// single worker thread would make them queue behind each other, so the
+    /// runtime gets a pool.
+    type Executor = cosmic::executor::multi::Executor;
     type Flags = ();
     type Message = Message;
     const APP_ID: &'static str = APP_ID;
@@ -190,6 +207,11 @@ impl Application for AppManager {
                 core,
                 nav_model,
                 apps: Vec::new(),
+                subtitles: Vec::new(),
+                icons: Vec::new(),
+                user_rows: Vec::new(),
+                system_groups: Vec::new(),
+                protected_total: 0,
                 query: String::new(),
                 loading: true,
                 selected: None,
@@ -204,6 +226,7 @@ impl Application for AppManager {
                 maint_url: String::new(),
                 maint_repo: None,
                 maint_release: None,
+                maint_assets: Vec::new(),
                 maint_status: String::new(),
                 maint_working: false,
             },
@@ -235,33 +258,43 @@ impl Application for AppManager {
             Message::Loaded(apps) => {
                 self.apps = apps;
                 self.loading = false;
+                self.rebuild_app_text();
+                self.rebuild_rows();
                 if self.selected_app().is_none() {
                     self.selected = None;
                 }
                 if self.detail_app().is_none() {
                     self.detail = None;
                 }
+                if self.menu_app().is_none() {
+                    self.menu = None;
+                }
                 Task::none()
             }
             Message::Search(query) => {
                 self.query = query;
                 self.menu = None;
-                if let Some(selected) = self.selected.clone()
-                    && !filter(&self.apps, &self.query)
-                        .iter()
-                        .any(|app| app.id == selected)
+                self.rebuild_rows();
+                if let Some(selected) = self.selected.as_deref()
+                    && !self.is_visible(selected)
                 {
                     self.selected = None;
                 }
                 Task::none()
             }
-            Message::OpenDetails(id) => {
+            Message::OpenDetails(index) => {
                 self.menu = None;
+                let Some(id) = self.apps.get(index).map(|app| app.id.clone()) else {
+                    return Task::none();
+                };
                 self.selected = Some(id.clone());
                 self.detail = Some(id);
                 Task::none()
             }
-            Message::Select(id) => {
+            Message::Select(index) => {
+                let Some(id) = self.apps.get(index).map(|app| app.id.clone()) else {
+                    return Task::none();
+                };
                 self.selected = Some(id);
                 Task::none()
             }
@@ -271,25 +304,25 @@ impl Application for AppManager {
             }
             Message::ToggleProtected => {
                 self.show_protected = !self.show_protected;
-                if self
-                    .selected_app()
-                    .is_some_and(|app| app.protected && !self.show_protected)
+                self.rebuild_rows();
+                if let Some(selected) = self.selected.as_deref()
+                    && !self.is_visible(selected)
                 {
                     self.selected = None;
                 }
                 Task::none()
             }
-            Message::OpenMenu(id) => {
-                self.menu = Some(id);
+            Message::OpenMenu(index) => {
+                self.menu = self.apps.get(index).map(|app| app.id.clone());
                 Task::none()
             }
             Message::CloseMenu => {
                 self.menu = None;
                 Task::none()
             }
-            Message::StartQuickRemoval(id) => {
+            Message::StartQuickRemoval(index) => {
                 self.menu = None;
-                let Some(app) = self.removable_app(&id) else {
+                let Some(app) = self.removable_at(index) else {
                     return Task::none();
                 };
                 if self.confirm_removals {
@@ -299,9 +332,9 @@ impl Application for AppManager {
                     self.begin_quick_check(app)
                 }
             }
-            Message::StartDetailedRemoval(id) => {
+            Message::StartDetailedRemoval(index) => {
                 self.menu = None;
-                let Some(app) = self.removable_app(&id) else {
+                let Some(app) = self.removable_at(index) else {
                     return Task::none();
                 };
                 self.selected = Some(app.id.clone());
@@ -443,15 +476,7 @@ impl Application for AppManager {
                 Task::none()
             }
             Message::Removed { app, result } => match result {
-                Ok(()) => {
-                    append_history(
-                        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).as_path(),
-                        &app.name,
-                        &format!("{:?}", app.origin),
-                        "removed",
-                    );
-                    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
-                    let items = find_leftovers(&app, &home);
+                Ok(items) => {
                     if items.is_empty() {
                         if matches!(self.dialog, Some(Dialog::Running)) {
                             self.dialog = None;
@@ -491,9 +516,8 @@ impl Application for AppManager {
                 self.dialog = Some(Dialog::Running);
                 Task::perform(
                     async move {
-                        for item in &items {
-                            let _ = trash_path(&item.path);
-                        }
+                        let paths: Vec<String> = items.into_iter().map(|item| item.path).collect();
+                        let _ = trash_paths(&paths);
                     },
                     |_| cosmic::Action::App(Message::LeftoversTrashed),
                 )
@@ -516,6 +540,7 @@ impl Application for AppManager {
                 self.maint_status = "Loading release…".to_owned();
                 self.maint_repo = None;
                 self.maint_release = None;
+                self.maint_assets.clear();
                 Task::perform(
                     async move {
                         let repo = Repo::parse(&url)?;
@@ -530,6 +555,7 @@ impl Application for AppManager {
                 match result {
                     Ok(release) => {
                         self.maint_status = format!("Loaded {}", release.tag);
+                        self.maint_assets = installable_assets(&release);
                         self.maint_release = Some(release);
                     }
                     Err(error) => {
@@ -539,10 +565,7 @@ impl Application for AppManager {
                 Task::none()
             }
             Message::InstallAsset(kind) => {
-                let Some(release) = self.maint_release.clone() else {
-                    return Task::none();
-                };
-                let Some(asset) = pick_asset(&release, kind) else {
+                let Some(asset) = self.maint_assets.iter().find(|a| a.kind == kind).cloned() else {
                     self.maint_status = "No asset of that kind found.".to_owned();
                     return Task::none();
                 };
@@ -550,24 +573,23 @@ impl Application for AppManager {
                 self.maint_status = format!("Downloading {}…", asset.name);
                 Task::perform(
                     async move {
-                        let destination = downloads_dir().join(&asset.name);
-                        download(&asset.url, &destination)?;
-                        match asset.kind {
-                            AssetKind::Deb => {
-                                install_deb(&destination)?;
-                                Ok(format!("Installed {}", asset.name))
+                        let destination = cache_dir().join(&asset.name);
+                        let installed = download(&asset.url, &destination).and_then(|()| {
+                            match asset.kind {
+                                AssetKind::Deb => install_deb(&destination),
+                                AssetKind::Flatpak => install_flatpak(&destination),
+                                AssetKind::AppImage => {
+                                    let target = applications_dir().join(&asset.name);
+                                    install_appimage(&destination, &target)
+                                }
+                                AssetKind::Other => Ok(()),
                             }
-                            AssetKind::Flatpak => {
-                                install_flatpak(&destination)?;
-                                Ok(format!("Installed {}", asset.name))
-                            }
-                            AssetKind::AppImage => {
-                                let target = applications_dir().join(&asset.name);
-                                install_appimage(&destination, &target)?;
-                                Ok(format!("Installed {}", target.display()))
-                            }
-                            AssetKind::Other => Ok(format!("Downloaded {}", destination.display())),
-                        }
+                        });
+                        // The download is only a means to install; do not leave
+                        // a second copy of the package behind.
+                        let _ = std::fs::remove_file(&destination);
+                        installed?;
+                        Ok(format!("Installed {}", asset.name))
                     },
                     |result| cosmic::Action::App(Message::AssetInstalled(result)),
                 )
@@ -592,9 +614,9 @@ impl Application for AppManager {
         }
 
         let body = self.body(page);
-        if let Some(app) = self.detail_app() {
+        if let Some((index, app)) = self.detail_app() {
             content = content.push(
-                widget::row![body, self.detail(app)]
+                widget::row![body, self.detail(index, app)]
                     .spacing(16)
                     .height(Length::Fill),
             );
@@ -623,16 +645,45 @@ impl AppManager {
         self.apps.iter().find(|app| app.id == id)
     }
 
-    fn detail_app(&self) -> Option<&InstalledApp> {
+    fn detail_app(&self) -> Option<(usize, &InstalledApp)> {
         let id = self.detail.as_deref()?;
+        let index = self.apps.iter().position(|app| app.id == id)?;
+        Some((index, &self.apps[index]))
+    }
+
+    fn menu_app(&self) -> Option<&InstalledApp> {
+        let id = self.menu.as_deref()?;
         self.apps.iter().find(|app| app.id == id)
     }
 
-    fn removable_app(&self, id: &str) -> Option<InstalledApp> {
-        self.apps
-            .iter()
-            .find(|app| app.id == id && !app.protected)
-            .cloned()
+    fn removable_at(&self, index: usize) -> Option<InstalledApp> {
+        self.apps.get(index).filter(|app| !app.protected).cloned()
+    }
+
+    /// Recomputes what each page shows. Only called when the inventory, the
+    /// search or the protected toggle changes — never from `view`.
+    fn rebuild_rows(&mut self) {
+        self.user_rows = matching(&self.apps, InstallKind::User, &self.query);
+        self.system_groups = system_groups(&self.apps, &self.query, self.show_protected);
+        self.protected_total = protected_count(&self.apps, &self.query);
+    }
+
+    /// Row text and icons, resolved once per inventory load.
+    fn rebuild_app_text(&mut self) {
+        self.subtitles = self.apps.iter().map(subtitle).collect();
+        self.icons = self.apps.iter().map(app_icon).collect();
+    }
+
+    /// Whether an app is currently listed on the page it belongs to.
+    fn is_visible(&self, id: &str) -> bool {
+        let Some(index) = self.apps.iter().position(|app| app.id == id) else {
+            return false;
+        };
+        self.user_rows.contains(&index)
+            || self
+                .system_groups
+                .iter()
+                .any(|group| group.rows.contains(&index))
     }
 
     fn set_confirm_removals(&mut self, confirm: bool) {
@@ -711,31 +762,50 @@ impl AppManager {
 
         match page {
             Page::Maintainer => self.maintainer_page(),
-            Page::User => self.list_page(apps_for(&self.apps, InstallKind::User, &self.query)),
-            Page::System => {
-                self.system_page(system_groups(&self.apps, &self.query, self.show_protected))
-            }
+            Page::User => self.list_page(&self.user_rows),
+            Page::System => self.system_page(&self.system_groups),
         }
     }
 
-    fn list_page(&self, apps: Vec<InstalledApp>) -> Element<'_, Message> {
-        if apps.is_empty() {
+    /// One row, borrowing its app, its precomputed subtitle and its icon.
+    fn row(&self, index: usize) -> Element<'_, Message> {
+        let Some(app) = self.apps.get(index) else {
+            return widget::Space::new().into();
+        };
+        let subtitle = self.subtitles.get(index).map(String::as_str).unwrap_or("");
+        let icon = self
+            .icons
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| widget::icon::from_name("application-x-executable").handle());
+        app_row(
+            app,
+            subtitle,
+            icon,
+            index,
+            self.is_selected(&app.id),
+            self.is_menu_open(&app.id),
+        )
+    }
+
+    fn list_page(&self, rows: &[usize]) -> Element<'_, Message> {
+        if rows.is_empty() {
             return centred(self.empty_message());
         }
 
-        let count = apps.len() as i64;
+        let count = rows.len() as i64;
         let mut list = widget::column![].spacing(4);
         list = list.push(text::caption(fl!("apps-count", count = count)));
-        for app in &apps {
-            list = list.push(app_row(app, self.is_selected(&app.id), self.is_menu_open(&app.id)));
+        for &index in rows {
+            list = list.push(self.row(index));
         }
 
         scrollable(list).height(Length::Fill).into()
     }
 
-    fn system_page(&self, groups: Vec<Group>) -> Element<'_, Message> {
+    fn system_page(&self, groups: &[Group]) -> Element<'_, Message> {
         let mut list = widget::column![].spacing(4);
-        let protected = self.protected_count();
+        let protected = self.protected_total;
 
         if protected > 0 {
             let count = protected as i64;
@@ -762,31 +832,19 @@ impl AppManager {
         }
 
         for group in groups {
-            let count = group.apps.len() as i64;
+            let count = group.rows.len() as i64;
             list = list.push(text::title3(group_title(group.kind)));
             list = list.push(text::caption(format!(
                 "{} · {}",
                 group_caption(group.kind),
                 fl!("apps-count", count = count)
             )));
-            for app in &group.apps {
-                list = list.push(app_row(
-                    app,
-                    self.is_selected(&app.id),
-                    self.is_menu_open(&app.id),
-                ));
+            for &index in &group.rows {
+                list = list.push(self.row(index));
             }
         }
 
         scrollable(list).height(Length::Fill).into()
-    }
-
-    /// Locked system apps that match the current search, shown or not.
-    fn protected_count(&self) -> usize {
-        apps_for(&self.apps, InstallKind::System, &self.query)
-            .iter()
-            .filter(|app| app.protected)
-            .count()
     }
 
     fn is_selected(&self, id: &str) -> bool {
@@ -950,23 +1008,15 @@ impl AppManager {
             card = card.push(text::caption(release.tag.clone()));
 
             let mut buttons = widget::row![].spacing(8);
-            for asset in &release.assets {
-                if !is_compatible(asset) {
-                    continue;
-                }
+            for asset in &self.maint_assets {
                 let label = match asset.kind {
-                    AssetKind::Deb => "Install .deb".to_owned(),
-                    AssetKind::AppImage => "Install .AppImage".to_owned(),
-                    AssetKind::Flatpak => "Install .flatpak".to_owned(),
+                    AssetKind::Deb => "Install .deb",
+                    AssetKind::AppImage => "Install .AppImage",
+                    AssetKind::Flatpak => "Install .flatpak",
                     AssetKind::Other => continue,
                 };
                 buttons = buttons.push(
-                    button::standard(label).on_press(match asset.kind {
-                        AssetKind::Deb => Message::InstallAsset(AssetKind::Deb),
-                        AssetKind::AppImage => Message::InstallAsset(AssetKind::AppImage),
-                        AssetKind::Flatpak => Message::InstallAsset(AssetKind::Flatpak),
-                        AssetKind::Other => Message::InstallAsset(AssetKind::Other),
-                    }),
+                    button::standard(label).on_press(Message::InstallAsset(asset.kind.clone())),
                 );
             }
             card = card.push(buttons);
@@ -979,7 +1029,7 @@ impl AppManager {
         container(content.padding(20).width(Length::Fill).height(Length::Fill)).into()
     }
 
-    fn detail(&self, app: &InstalledApp) -> Element<'_, Message> {
+    fn detail(&self, index: usize, app: &InstalledApp) -> Element<'_, Message> {
         let mut content = widget::column![].spacing(12);
         content = content.push(self.pane_header(fl!("details")));
 
@@ -1015,7 +1065,7 @@ impl AppManager {
             .spacing(6)
         } else {
             widget::column![button::destructive(fl!("remove"))
-                .on_press(Message::StartDetailedRemoval(app.id.clone()))]
+                .on_press(Message::StartDetailedRemoval(index))]
         };
         content = content.push(remove);
         content = content.push(
@@ -1126,14 +1176,26 @@ fn detailed_plan(app: InstalledApp) -> Task<Message> {
 }
 
 /// Runs the removal off the UI thread. `sudo` and `gio` may wait on disk, so
-/// the app must stay responsive.
+/// the app must stay responsive. History and leftover detection happen there
+/// too: both touch the disk and have no business on the UI thread.
 fn remove_app(app: InstalledApp) -> Task<Message> {
     Task::perform(
         async move {
             let (sender, receiver) = cosmic::iced::futures::channel::oneshot::channel();
             let thread_app = app.clone();
             std::thread::spawn(move || {
-                let _ = sender.send(run_removal(&thread_app));
+                let result = run_removal(&thread_app).map(|()| {
+                    let home =
+                        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+                    append_history(
+                        &home,
+                        &thread_app.name,
+                        &format!("{:?}", thread_app.origin),
+                        "removed",
+                    );
+                    find_leftovers(&thread_app, &home)
+                });
+                let _ = sender.send(result);
             });
             let result = receiver
                 .await
@@ -1197,21 +1259,21 @@ fn group_caption(kind: GroupKind) -> String {
 
 /// One app row with its three-dot menu. The row itself is not clickable:
 /// details open from the menu, so removing stays a deliberate action.
-fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'static, Message> {
-    let icon_name = app
-        .icon
-        .clone()
-        .unwrap_or_else(|| "application-x-executable".to_owned());
-    let icon = widget::icon::from_name(icon_name).size(32);
+///
+/// The subtitle and the icon arrive precomputed and the row is identified by
+/// its index, so a redraw neither formats texts nor clones ids.
+fn app_row<'a>(
+    app: &'a InstalledApp,
+    subtitle: &'a str,
+    icon: widget::icon::Handle,
+    index: usize,
+    selected: bool,
+    menu_open: bool,
+) -> Element<'a, Message> {
+    let icon = widget::icon::icon(icon).size(32);
 
-    let title = text(app.name.clone()).size(15);
-    let subtitle = text(format!(
-        "{} · {} · {}",
-        origin_label(app.origin),
-        version_label(app),
-        format_size(app.size_bytes),
-    ))
-    .size(12);
+    let title = text(app.name.as_str()).size(15);
+    let subtitle = text(subtitle).size(12);
 
     let labels = widget::column![title, subtitle]
         .spacing(2)
@@ -1225,10 +1287,10 @@ fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'stat
     }
 
     let menu_icon = button::icon(widget::icon::from_name("open-menu-symbolic").size(16))
-        .on_press(Message::OpenMenu(app.id.clone()));
-    let menu_button: Element<'static, Message> = if menu_open {
+        .on_press(Message::OpenMenu(index));
+    let menu_button: Element<'a, Message> = if menu_open {
         widget::popover(menu_icon)
-            .popup(menu_popup(app))
+            .popup(menu_popup(app, index))
             .position(widget::popover::Position::Bottom)
             .on_close(Message::CloseMenu)
             .into()
@@ -1255,28 +1317,28 @@ fn app_row(app: &InstalledApp, selected: bool, menu_open: bool) -> Element<'stat
         cosmic::theme::Container::Transparent
     };
 
-    let row: Element<'static, Message> = container(row)
+    let row: Element<'a, Message> = container(row)
         .padding(8)
         .width(Length::Fill)
         .class(style)
         .into();
 
     widget::mouse_area(row)
-        .on_press(Message::Select(app.id.clone()))
+        .on_press(Message::Select(index))
         .into()
 }
 
-fn menu_popup(app: &InstalledApp) -> Element<'static, Message> {
-    let details: Element<'static, Message> = button::text(fl!("details"))
-        .on_press(Message::OpenDetails(app.id.clone()))
+fn menu_popup<'a>(app: &'a InstalledApp, index: usize) -> Element<'a, Message> {
+    let details: Element<'a, Message> = button::text(fl!("details"))
+        .on_press(Message::OpenDetails(index))
         .into();
 
     let mut menu = widget::column![details].spacing(4).width(Length::Fixed(220.0));
     if app.protected {
         menu = menu.push(text::caption(fl!("remove-blocked")));
     } else {
-        let remove: Element<'static, Message> = button::destructive(fl!("remove"))
-            .on_press(Message::StartQuickRemoval(app.id.clone()))
+        let remove: Element<'a, Message> = button::destructive(fl!("remove"))
+            .on_press(Message::StartQuickRemoval(index))
             .into();
         menu = menu.push(remove);
     }
@@ -1285,6 +1347,22 @@ fn menu_popup(app: &InstalledApp) -> Element<'static, Message> {
         .padding(6)
         .class(cosmic::theme::Container::Dropdown)
         .into()
+}
+
+/// The one line every row shows under the app name.
+fn subtitle(app: &InstalledApp) -> String {
+    format!(
+        "{} · {} · {}",
+        origin_label(app.origin),
+        version_label(app),
+        format_size(app.size_bytes),
+    )
+}
+
+/// Resolves an app's icon once, instead of on every redraw.
+fn app_icon(app: &InstalledApp) -> widget::icon::Handle {
+    let name = app.icon.as_deref().unwrap_or("application-x-executable");
+    widget::icon::from_name(name).handle()
 }
 
 fn origin_label(origin: Origin) -> String {

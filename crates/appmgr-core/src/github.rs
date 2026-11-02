@@ -3,6 +3,7 @@
 //! through `curl` and the system package tools, never through a shell.
 
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repo {
@@ -35,20 +36,6 @@ impl Repo {
             owner: owner.to_owned(),
             name: name.trim_end_matches(".git").to_owned(),
         })
-    }
-
-    pub fn releases_url(&self) -> String {
-        format!(
-            "https://api.github.com/repos/{}/{}",
-            self.owner, self.name
-        )
-    }
-
-    pub fn latest_release_url(&self) -> String {
-        format!(
-            "https://api.github.com/repos/{}/{}/releases/latest",
-            self.owner, self.name
-        )
     }
 }
 
@@ -130,29 +117,36 @@ impl Release {
 }
 
 /// Returns the Debian architecture of the running system (e.g. `amd64`).
-pub fn system_arch() -> String {
+///
+/// The answer cannot change while the app runs, and asking costs a process
+/// spawn, so it is detected once and kept.
+pub fn system_arch() -> &'static str {
+    static ARCH: OnceLock<String> = OnceLock::new();
+    ARCH.get_or_init(detect_arch)
+}
+
+fn detect_arch() -> String {
     if let Ok(output) = std::process::Command::new("dpkg")
         .args(["--print-architecture"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let arch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !arch.is_empty() {
-                return arch;
-            }
+        let arch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !arch.is_empty() {
+            return arch;
         }
     }
     // Fallback to uname -m, mapped to Debian-style names.
-    if let Ok(output) = std::process::Command::new("uname").arg("-m").output() {
-        if output.status.success() {
-            let m = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            return match m.as_str() {
-                "x86_64" => "amd64".to_owned(),
-                "aarch64" => "arm64".to_owned(),
-                "armv7l" => "armhf".to_owned(),
-                other => other.to_owned(),
-            };
-        }
+    if let Ok(output) = std::process::Command::new("uname").arg("-m").output()
+        && output.status.success()
+    {
+        let machine = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return match machine.as_str() {
+            "x86_64" => "amd64".to_owned(),
+            "aarch64" => "arm64".to_owned(),
+            "armv7l" => "armhf".to_owned(),
+            other => other.to_owned(),
+        };
     }
     "amd64".to_owned()
 }
@@ -162,38 +156,42 @@ const KNOWN_ARCHES: &[&str] = &[
     "x86_64", "aarch64", "armv7",
 ];
 
+/// Whether a token found in an asset name is the architecture we run on.
+fn arch_matches(arch: &str, token: &str) -> bool {
+    arch == token
+        || matches!(
+            (arch, token),
+            ("amd64", "x86_64") | ("arm64", "aarch64") | ("armhf", "armv7")
+        )
+}
+
 /// Returns true when the asset name is compatible with the running system.
 pub fn is_compatible(asset: &Asset) -> bool {
     let arch = system_arch();
-    let name = asset.name.to_lowercase();
-    // Debian arch tokens and their uname equivalents.
-    let mut candidates = vec![arch.clone()];
-    match arch.as_str() {
-        "amd64" => candidates.push("x86_64".to_owned()),
-        "arm64" => candidates.push("aarch64".to_owned()),
-        _ => {}
+    let name = asset.name.to_ascii_lowercase();
+    // An asset that names an architecture must name ours; one that names none
+    // is generic and assumed to run anywhere.
+    let mut mentioned = false;
+    for known in KNOWN_ARCHES {
+        if name.contains(known) {
+            mentioned = true;
+            if arch_matches(arch, known) {
+                return true;
+            }
+        }
     }
-    // If the name mentions a known arch, it must be one of ours.
-    let mentioned: Vec<&str> = KNOWN_ARCHES
-        .iter()
-        .copied()
-        .filter(|a| name.contains(a))
-        .collect();
-    if mentioned.is_empty() {
-        return true; // generic asset, assume compatible
-    }
-    mentioned.iter().any(|a| candidates.iter().any(|c| c == *a))
+    !mentioned
 }
 
-/// Picks the first asset of the requested kind, preferring the one whose name
-/// matches the architecture of the running system.
-pub fn pick_asset(release: &Release, kind: AssetKind) -> Option<Asset> {
+/// The assets the user can install: only the package formats the app handles,
+/// and only those built for this machine.
+pub fn installable_assets(release: &Release) -> Vec<Asset> {
     release
         .assets
         .iter()
-        .filter(|a| a.kind == kind && is_compatible(a))
-        .min_by_key(|a| a.size)
+        .filter(|asset| asset.kind != AssetKind::Other && is_compatible(asset))
         .cloned()
+        .collect()
 }
 
 /// Fetches the latest release JSON for `repo` through curl. The network call
@@ -206,6 +204,10 @@ pub fn fetch_latest(repo: &Repo) -> Result<String, String> {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
@@ -278,7 +280,30 @@ mod tests {
         let release = Release::parse_json(json).unwrap();
         assert_eq!(release.tag, "v1.2.3");
         assert_eq!(release.assets.len(), 2);
-        assert_eq!(pick_asset(&release, AssetKind::Deb).unwrap().name, "app.deb");
+        assert_eq!(installable_assets(&release).len(), 2);
+    }
+
+    #[test]
+    fn keeps_only_installable_compatible_assets() {
+        let foreign = if system_arch() == "amd64" {
+            "aarch64"
+        } else {
+            "amd64"
+        };
+        let json = format!(
+            r#"{{
+                "tag_name": "v1",
+                "assets": [
+                    {{"name": "app_{foreign}.deb", "browser_download_url": "u", "size": 1}},
+                    {{"name": "app.deb", "browser_download_url": "u", "size": 1}},
+                    {{"name": "SHA256SUMS", "browser_download_url": "u", "size": 1}}
+                ]
+            }}"#
+        );
+        let release = Release::parse_json(&json).unwrap();
+        let assets = installable_assets(&release);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].name, "app.deb");
     }
 
     #[test]

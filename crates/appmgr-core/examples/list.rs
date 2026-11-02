@@ -10,7 +10,7 @@ fn main() {
     let elapsed = started.elapsed();
 
     let mut apps = apps;
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.sort_by_key(|app| app.name.to_lowercase());
 
     for app in &apps {
         let kind = match app.kind {

@@ -15,19 +15,6 @@ pub enum LeftoverKind {
     Icon,
 }
 
-impl LeftoverKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            LeftoverKind::Config => "config",
-            LeftoverKind::Data => "data",
-            LeftoverKind::Cache => "cache",
-            LeftoverKind::SystemdUnit => "systemd unit",
-            LeftoverKind::DesktopEntry => "desktop entry",
-            LeftoverKind::Icon => "icon",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leftover {
     pub path: String,
@@ -44,15 +31,15 @@ pub fn find_leftovers(app: &App, home: &Path) -> Vec<Leftover> {
     if let Some(package) = &app.package {
         push_needle(&mut needles, package);
     }
-    if let Some(stripped) = app.id.strip_prefix("appimage:") {
-        if let Some(name) = Path::new(stripped).file_name() {
-            push_needle(&mut needles, &name.to_string_lossy());
-        }
+    if let Some(stripped) = app.id.strip_prefix("appimage:")
+        && let Some(name) = Path::new(stripped).file_name()
+    {
+        push_needle(&mut needles, &name.to_string_lossy());
     }
     // Flatpak id is already in `package` for Flatpak apps, but the id also
     // contains dots that map to a directory name in some setups.
     if app.origin == crate::inventory::Origin::Flatpak {
-        push_needle(&mut needles, &app.id.trim_start_matches("flatpak:").to_owned());
+        push_needle(&mut needles, app.id.trim_start_matches("flatpak:"));
     }
 
     let mut leftovers = Vec::new();
@@ -109,10 +96,10 @@ pub fn find_leftovers(app: &App, home: &Path) -> Vec<Leftover> {
     }
 
     // AppImage integration: .desktop entries and icons pointing at the file
-    if app.origin == crate::inventory::Origin::AppImage {
-        if let Some(image_path) = app.id.strip_prefix("appimage:") {
-            leftovers.extend(find_appimage_integration(image_path, home));
-        }
+    if app.origin == crate::inventory::Origin::AppImage
+        && let Some(image_path) = app.id.strip_prefix("appimage:")
+    {
+        leftovers.extend(find_appimage_integration(image_path, home));
     }
 
     // Flatpak data directory in ~/.var/app/<id>
@@ -149,10 +136,11 @@ fn push_needle(needles: &mut Vec<String>, value: &str) {
         needles.push(slug);
     }
     // First word only, for multi-word names like "COSMIC Files".
-    if let Some(first) = needle.split_whitespace().next() {
-        if first.len() >= 3 && !needles.contains(&first.to_owned()) {
-            needles.push(first.to_owned());
-        }
+    if let Some(first) = needle.split_whitespace().next()
+        && first.len() >= 3
+        && !needles.iter().any(|known| known == first)
+    {
+        needles.push(first.to_owned());
     }
 }
 
@@ -183,13 +171,13 @@ fn find_appimage_integration(image_path: &str, home: &Path) -> Vec<Leftover> {
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if content.contains(image_path) {
-                    leftovers.push(Leftover {
-                        path: path.to_string_lossy().to_string(),
-                        kind: LeftoverKind::DesktopEntry,
-                    });
-                }
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && content.contains(image_path)
+            {
+                leftovers.push(Leftover {
+                    path: path.to_string_lossy().to_string(),
+                    kind: LeftoverKind::DesktopEntry,
+                });
             }
         }
     }
@@ -228,11 +216,15 @@ fn collect_icons(root: &Path, stem: &str, leftovers: &mut Vec<Leftover>) {
     }
 }
 
-/// Sends a single path to the trash. Returns an error if `gio` is missing
-/// or refuses.
-pub fn trash_path(path: &str) -> Result<(), String> {
+/// Sends paths to the trash in one `gio` call. Returns an error if `gio` is
+/// missing or refuses.
+pub fn trash_paths(paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
     let output = std::process::Command::new("gio")
-        .args(["trash", path])
+        .arg("trash")
+        .args(paths)
         .output()
         .map_err(|error| format!("could not run gio: {error}"))?;
     if output.status.success() {

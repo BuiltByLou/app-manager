@@ -1,9 +1,10 @@
 use appmgr_core::inventory::{App, InstallKind};
 
-/// A set of apps with its own heading inside a page.
+/// A set of apps with its own heading inside a page. Rows are indices into the
+/// inventory, so the view borrows instead of cloning the apps on every redraw.
 pub struct Group {
     pub kind: GroupKind,
-    pub apps: Vec<App>,
+    pub rows: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,56 +13,65 @@ pub enum GroupKind {
     Removable,
 }
 
-/// Filters by name or package, ignoring case.
-pub fn filter<'a>(apps: &'a [App], query: &str) -> Vec<&'a App> {
-    let query = query.trim().to_lowercase();
+/// Whether `app` matches an already-normalised (trimmed, lowercase) query.
+pub fn matches(app: &App, query: &str) -> bool {
     if query.is_empty() {
-        return apps.iter().collect();
+        return true;
     }
-    apps.iter()
-        .filter(|app| {
-            app.name.to_lowercase().contains(&query)
-                || app
-                    .package
-                    .as_deref()
-                    .is_some_and(|package| package.to_lowercase().contains(&query))
-        })
-        .collect()
+    app.name.to_lowercase().contains(query)
+        || app
+            .package
+            .as_deref()
+            .is_some_and(|package| package.to_lowercase().contains(query))
 }
 
-/// Apps of a single kind, filtered and sorted alphabetically.
-pub fn apps_for(apps: &[App], kind: InstallKind, query: &str) -> Vec<App> {
-    let mut matching: Vec<App> = filter(apps, query)
-        .into_iter()
-        .filter(|app| app.kind == kind)
-        .cloned()
+fn normalise(query: &str) -> String {
+    query.trim().to_lowercase()
+}
+
+/// Indices of the apps of `kind` that match `query`, sorted by name.
+pub fn matching(apps: &[App], kind: InstallKind, query: &str) -> Vec<usize> {
+    let query = normalise(query);
+    let mut rows: Vec<usize> = apps
+        .iter()
+        .enumerate()
+        .filter(|(_, app)| app.kind == kind && matches(app, &query))
+        .map(|(index, _)| index)
         .collect();
-    matching.sort_by_key(|app| app.name.to_lowercase());
-    matching
+    rows.sort_by_cached_key(|&index| apps[index].name.to_lowercase());
+    rows
 }
 
 /// The system apps, split between removable and protected. Removable ones come
 /// first; protected ones are locked, so they sit at the bottom and can be
 /// hidden. `show_protected` keeps them out of the list entirely when false.
 pub fn system_groups(apps: &[App], query: &str, show_protected: bool) -> Vec<Group> {
-    let (protected, removable): (Vec<App>, Vec<App>) = apps_for(apps, InstallKind::System, query)
+    let (protected, removable): (Vec<usize>, Vec<usize>) = matching(apps, InstallKind::System, query)
         .into_iter()
-        .partition(|app| app.protected);
+        .partition(|&index| apps[index].protected);
 
     let mut groups = Vec::new();
     if !removable.is_empty() {
         groups.push(Group {
             kind: GroupKind::Removable,
-            apps: removable,
+            rows: removable,
         });
     }
     if show_protected && !protected.is_empty() {
         groups.push(Group {
             kind: GroupKind::Protected,
-            apps: protected,
+            rows: protected,
         });
     }
     groups
+}
+
+/// How many locked system apps match the current search, shown or not.
+pub fn protected_count(apps: &[App], query: &str) -> usize {
+    matching(apps, InstallKind::System, query)
+        .iter()
+        .filter(|&&index| apps[index].protected)
+        .count()
 }
 
 /// Human-readable size: "512 B", "12 kB", "58.2 MB", "1.4 GB".
@@ -106,63 +116,64 @@ mod tests {
         ]
     }
 
+    fn names<'a>(apps: &'a [App], rows: &[usize]) -> Vec<&'a str> {
+        rows.iter().map(|&index| apps[index].name.as_str()).collect()
+    }
+
     #[test]
     fn filters_by_name_ignoring_case() {
         let apps = sample();
-        let found = filter(&apps, "FIREF");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name, "Firefox");
+        let found = matching(&apps, InstallKind::System, "FIREF");
+        assert_eq!(names(&apps, &found), vec!["Firefox"]);
     }
 
     #[test]
     fn filters_by_package_name() {
         let apps = sample();
-        assert_eq!(filter(&apps, "cosmic").len(), 1);
+        assert_eq!(names(&apps, &matching(&apps, InstallKind::System, "cosmic")), vec!["COSMIC Store"]);
     }
 
     #[test]
-    fn empty_query_keeps_everything() {
+    fn empty_query_keeps_everything_of_that_kind() {
         let apps = sample();
-        assert_eq!(filter(&apps, "  ").len(), 4);
+        assert_eq!(matching(&apps, InstallKind::User, "  ").len(), 2);
     }
 
     #[test]
     fn shows_only_the_requested_group() {
         let apps = sample();
-        let user = apps_for(&apps, InstallKind::User, "");
+        let user = matching(&apps, InstallKind::User, "");
         assert_eq!(user.len(), 2);
-        assert!(user.iter().all(|a| a.kind == InstallKind::User));
+        assert!(user.iter().all(|&index| apps[index].kind == InstallKind::User));
     }
 
     #[test]
     fn sorts_alphabetically_ignoring_case() {
         let apps = sample();
-        let ordered = apps_for(&apps, InstallKind::System, "");
-        let system: Vec<&str> = ordered.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(system, vec!["COSMIC Store", "Firefox"]);
+        let ordered = matching(&apps, InstallKind::System, "");
+        assert_eq!(names(&apps, &ordered), vec!["COSMIC Store", "Firefox"]);
     }
 
     #[test]
     fn combines_search_and_group() {
         let apps = sample();
-        let found = apps_for(&apps, InstallKind::User, "bra");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name, "brave");
+        assert_eq!(names(&apps, &matching(&apps, InstallKind::User, "bra")), vec!["brave"]);
     }
 
     #[test]
     fn no_match_means_empty() {
-        assert!(apps_for(&sample(), InstallKind::User, "firefox").is_empty());
+        assert!(matching(&sample(), InstallKind::User, "firefox").is_empty());
     }
 
     #[test]
     fn separates_protected_system_apps_from_the_rest() {
-        let groups = system_groups(&sample(), "", true);
+        let apps = sample();
+        let groups = system_groups(&apps, "", true);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].kind, GroupKind::Removable);
-        assert_eq!(groups[0].apps[0].name, "Firefox");
+        assert_eq!(names(&apps, &groups[0].rows), vec!["Firefox"]);
         assert_eq!(groups[1].kind, GroupKind::Protected);
-        assert_eq!(groups[1].apps[0].name, "COSMIC Store");
+        assert_eq!(names(&apps, &groups[1].rows), vec!["COSMIC Store"]);
     }
 
     #[test]
@@ -175,10 +186,11 @@ mod tests {
 
     #[test]
     fn hides_protected_apps_when_asked_to() {
-        let groups = system_groups(&sample(), "", false);
+        let apps = sample();
+        let groups = system_groups(&apps, "", false);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].kind, GroupKind::Removable);
-        assert_eq!(groups[0].apps[0].name, "Firefox");
+        assert_eq!(names(&apps, &groups[0].rows), vec!["Firefox"]);
     }
 
     #[test]
@@ -187,6 +199,14 @@ mod tests {
         let groups = system_groups(&apps, "firefox", true);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].kind, GroupKind::Removable);
+    }
+
+    #[test]
+    fn counts_protected_matches_even_when_hidden() {
+        let apps = sample();
+        assert_eq!(protected_count(&apps, ""), 1);
+        assert_eq!(protected_count(&apps, "cosmic"), 1);
+        assert_eq!(protected_count(&apps, "firefox"), 0);
     }
 
     #[test]

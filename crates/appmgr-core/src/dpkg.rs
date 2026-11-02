@@ -94,54 +94,6 @@ pub fn parse_relations(text: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Lê a saída de `apt-cache depends <metapacote>...`: devolve os pacotes
-/// reais de que ele depende ou recomenda, diretos.
-pub fn parse_apt_depends(text: &str) -> HashSet<String> {
-    let mut packages = HashSet::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let indent = line.len() - line.trim_start().len();
-
-        // Linhas indentadas a fundo são os fornecedores reais de um virtual.
-        if indent >= 4 {
-            if !trimmed.contains(':')
-                && let Some(name) = trimmed.split_whitespace().next()
-            {
-                packages.insert(name.to_owned());
-            }
-            continue;
-        }
-        if indent != 2 {
-            continue;
-        }
-
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        if !matches!(
-            key.trim_start_matches('|'),
-            "Depends" | "PreDepends" | "Recommends"
-        ) {
-            continue;
-        }
-
-        let value = value.trim();
-        // Pacotes virtuais ficam de fora: os fornecedores aparecem nas linhas
-        // indentadas abaixo.
-        if value.starts_with('<') {
-            continue;
-        }
-        if let Some(name) = value.split_whitespace().next() {
-            packages.insert(name.to_owned());
-        }
-    }
-
-    packages
-}
 
 /// Lê a saída de `apt-mark showmanual`: um pacote por linha.
 pub fn parse_apt_mark_manual(text: &str) -> HashSet<String> {
@@ -234,27 +186,6 @@ Auto-Installed: 1
         assert_eq!(names.len(), 4);
     }
 
-    #[test]
-    fn parses_direct_dependencies_of_a_metapackage() {
-        let text = "\
-pop-desktop
-  PreDepends: pop-de-cosmic
-  Depends: cosmic-session (= 1.0)
-  Depends: <virtual-package>
-    real-provider
-  Recommends: cosmic-term
-  Suggests: extra
-  Breaks: broken
-";
-        let packages = parse_apt_depends(text);
-        assert!(packages.contains("pop-de-cosmic"));
-        assert!(packages.contains("cosmic-session"));
-        assert!(packages.contains("cosmic-term"));
-        assert!(packages.contains("real-provider"));
-        assert!(!packages.contains("extra"));
-        assert!(!packages.contains("broken"));
-        assert!(!packages.contains("virtual-package"));
-    }
     #[test]
     fn reads_manual_packages() {
         let manual = parse_apt_mark_manual(MANUAL);

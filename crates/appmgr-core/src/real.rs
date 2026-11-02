@@ -11,6 +11,12 @@ pub struct RealProbe {
     home: PathBuf,
 }
 
+impl Default for RealProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RealProbe {
     pub fn new() -> Self {
         let home = std::env::var_os("HOME")
@@ -77,32 +83,29 @@ impl SystemProbe for RealProbe {
         .unwrap_or_default()
     }
 
-    fn manual_packages(&self) -> HashSet<String> {
+    fn manual_packages(&self, packages: &[InstalledPackage]) -> HashSet<String> {
         let Ok(text) = std::fs::read_to_string("/var/lib/apt/extended_states") else {
             return run(Command::new("apt-mark").arg("showmanual"))
                 .map(|out| parse_apt_mark_manual(&out))
                 .unwrap_or_default();
         };
         let auto = parse_auto_installed(&text);
-        self.packages()
-            .into_iter()
+        packages
+            .iter()
             .map(|package| crate::dpkg::base_name(&package.name).to_owned())
             .filter(|name| !auto.contains(name))
             .collect()
     }
 
     fn desktop_packages(&self) -> HashSet<String> {
-        ["pop-desktop", "cosmic-session", "ubuntu-desktop"]
-            .iter()
-            .filter_map(|metapackage| {
-                run(Command::new("dpkg-query").args([
-                    "-W",
-                    "-f=${Depends}\n${Recommends}",
-                    metapackage,
-                ]))
-            })
-            .flat_map(|out| crate::dpkg::parse_relations(&out))
-            .collect()
+        // One dpkg-query for all metapackages. A missing one must not drop the
+        // output of the others, so the output is read regardless of status.
+        let mut command = Command::new("dpkg-query");
+        command.args(["-W", "-f=${Depends}\n${Recommends}\n"]);
+        command.args(["pop-desktop", "cosmic-session", "ubuntu-desktop"]);
+        run_stdout(&mut command)
+            .map(|out| crate::dpkg::parse_relations(&out))
+            .unwrap_or_default()
     }
 
     fn package_owners(&self, paths: &[PathBuf]) -> HashMap<PathBuf, String> {
