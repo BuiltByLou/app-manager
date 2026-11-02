@@ -37,6 +37,24 @@ impl Repo {
             name: name.trim_end_matches(".git").to_owned(),
         })
     }
+
+    /// `owner/repo`, the form stored in the source registry and shown in the UI.
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    pub fn release_url(&self, tag: &str) -> String {
+        format!(
+            "https://github.com/{}/{}/releases/tag/{}",
+            self.owner, self.name, tag
+        )
+    }
+}
+
+impl std::fmt::Display for Repo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.slug())
+    }
 }
 
 fn is_safe_segment(value: &str) -> bool {
@@ -46,12 +64,34 @@ fn is_safe_segment(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
     Deb,
     AppImage,
     Flatpak,
     Other,
+}
+
+impl AssetKind {
+    /// Stable name used by the source registry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AssetKind::Deb => "deb",
+            AssetKind::AppImage => "appimage",
+            AssetKind::Flatpak => "flatpak",
+            AssetKind::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deb" => Some(AssetKind::Deb),
+            "appimage" => Some(AssetKind::AppImage),
+            "flatpak" => Some(AssetKind::Flatpak),
+            "other" => Some(AssetKind::Other),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +289,30 @@ mod tests {
     fn strips_git_suffix() {
         let repo = Repo::parse("https://github.com/owner/repo.git").unwrap();
         assert_eq!(repo.name, "repo");
+    }
+
+    #[test]
+    fn keeps_the_slug_and_builds_release_links() {
+        let repo = Repo::parse("https://github.com/owner/repo").unwrap();
+        assert_eq!(repo.slug(), "owner/repo");
+        assert_eq!(repo.to_string(), "owner/repo");
+        assert_eq!(
+            repo.release_url("v1.2.3"),
+            "https://github.com/owner/repo/releases/tag/v1.2.3"
+        );
+    }
+
+    #[test]
+    fn asset_kind_names_round_trip() {
+        for kind in [
+            AssetKind::Deb,
+            AssetKind::AppImage,
+            AssetKind::Flatpak,
+            AssetKind::Other,
+        ] {
+            assert_eq!(AssetKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(AssetKind::parse("snap"), None);
     }
 
     #[test]

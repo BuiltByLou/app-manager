@@ -102,7 +102,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
         apps.push(App {
             id,
             name,
-            version: None,
+            version: crate::version::version_from_filename(&path),
             icon: None,
             origin: Origin::AppImage,
             kind: InstallKind::User,
@@ -397,6 +397,20 @@ mod tests {
         assert_eq!(tool.len(), 1);
         assert_eq!(tool[0].origin, Origin::AppImage);
         assert_eq!(tool[0].kind, InstallKind::User);
+    }
+
+    #[test]
+    fn reads_an_appimage_version_from_its_filename() {
+        let mut system = fake();
+        system.appimages = vec![PathBuf::from(
+            "/home/ed/Applications/sonora-v0.45.0-x86_64.AppImage",
+        )];
+        let apps = build_inventory(&system);
+        let sonora = apps
+            .iter()
+            .find(|app| app.origin == Origin::AppImage)
+            .expect("appimage");
+        assert_eq!(sonora.version.as_deref(), Some("v0.45.0"));
     }
 
     #[test]

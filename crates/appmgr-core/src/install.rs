@@ -36,8 +36,98 @@ pub fn install_deb(path: &Path) -> Result<(), String> {
     run_sudo(&["apt-get", "install", "-y", &path.to_string_lossy()])
 }
 
-pub fn install_flatpak(path: &Path) -> Result<(), String> {
-    run_sudo(&["flatpak", "install", "-y", &path.to_string_lossy()])
+/// Installs or updates a Flatpak bundle and returns the installed app id.
+pub fn install_flatpak(path: &Path) -> Result<String, String> {
+    let output = run_sudo_output(&[
+        "flatpak",
+        "install",
+        "--bundle",
+        "--assumeyes",
+        "--noninteractive",
+        "--or-update",
+        &path.to_string_lossy(),
+    ])?;
+    parse_flatpak_ref(&output)
+        .ok_or_else(|| "flatpak finished without reporting which app it installed".to_owned())
+}
+
+/// Reads the `Package:` field from a `.deb` without installing it.
+pub fn deb_package_name(path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("dpkg-deb")
+        .args(["-f", &path.to_string_lossy(), "Package"])
+        .output()
+        .map_err(|error| format!("could not run dpkg-deb: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "dpkg-deb exited with {}",
+                output.status.code().unwrap_or(-1)
+            )
+        } else {
+            stderr
+        });
+    }
+    parse_deb_package_field(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| "the package does not declare a name".to_owned())
+}
+
+fn parse_deb_package_field(text: &str) -> Option<String> {
+    let name = text.lines().next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// Extracts the app id from `flatpak install` output, which mentions a ref
+/// such as `app/org.example.App/x86_64/stable`.
+fn parse_flatpak_ref(output: &str) -> Option<String> {
+    output.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix("app/")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Stable file name for an AppImage installed from `repo`. Keeping the version
+/// out of the name is what lets an update replace the file in place.
+pub fn stable_appimage_path(repo_name: &str) -> PathBuf {
+    let stem: String = repo_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    applications_dir().join(format!("{stem}.AppImage"))
+}
+
+/// The files an AppImage install created for itself: the image, its desktop
+/// entry and its icon. Used to clean up after an update moved to a new name.
+pub fn appimage_integration_paths(image: &Path, home: &Path) -> Vec<PathBuf> {
+    let Some(stem) = image.file_stem().and_then(|stem| stem.to_str()) else {
+        return Vec::new();
+    };
+
+    let mut paths = vec![
+        image.to_path_buf(),
+        home.join(".local/share/applications")
+            .join(format!("{stem}.desktop")),
+    ];
+    for extension in ["png", "svg", "xpm"] {
+        paths.push(
+            home.join(".local/share/icons")
+                .join(format!("{stem}.{extension}")),
+        );
+    }
+    paths
 }
 
 pub fn install_appimage(source: &Path, destination: &Path) -> Result<(), String> {
@@ -161,6 +251,10 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
 }
 
 fn run_sudo(args: &[&str]) -> Result<(), String> {
+    run_sudo_output(args).map(|_| ())
+}
+
+fn run_sudo_output(args: &[&str]) -> Result<String, String> {
     let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
     full.push("sudo");
     full.push("-n");
@@ -170,7 +264,7 @@ fn run_sudo(args: &[&str]) -> Result<(), String> {
         .output()
         .map_err(|error| format!("could not run sudo: {error}"))?;
     if output.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         Err(if stderr.is_empty() {
@@ -206,5 +300,48 @@ mod tests {
     fn applications_dir_is_under_home() {
         let dir = applications_dir();
         assert!(dir.ends_with("Applications"));
+    }
+
+    #[test]
+    fn reads_the_package_name_from_dpkg_deb_output() {
+        assert_eq!(
+            parse_deb_package_field("sonora\n").as_deref(),
+            Some("sonora")
+        );
+        assert_eq!(parse_deb_package_field("  \n"), None);
+    }
+
+    #[test]
+    fn reads_the_app_id_from_flatpak_output() {
+        let output = "Installing app/io.github.example.Sonora/x86_64/stable\n";
+        assert_eq!(
+            parse_flatpak_ref(output).as_deref(),
+            Some("io.github.example.Sonora")
+        );
+        assert_eq!(parse_flatpak_ref("nothing here"), None);
+    }
+
+    #[test]
+    fn stable_appimage_name_has_no_version() {
+        let path = stable_appimage_path("sonora");
+        assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("sonora.AppImage"));
+    }
+
+    #[test]
+    fn lists_everything_an_appimage_install_created() {
+        let home = Path::new("/home/ed");
+        let paths = appimage_integration_paths(
+            Path::new("/home/ed/Applications/sonora-v0.45.0-x86_64.AppImage"),
+            home,
+        );
+        assert!(paths.contains(&PathBuf::from(
+            "/home/ed/Applications/sonora-v0.45.0-x86_64.AppImage"
+        )));
+        assert!(paths.contains(&PathBuf::from(
+            "/home/ed/.local/share/applications/sonora-v0.45.0-x86_64.desktop"
+        )));
+        assert!(paths.contains(&PathBuf::from(
+            "/home/ed/.local/share/icons/sonora-v0.45.0-x86_64.png"
+        )));
     }
 }

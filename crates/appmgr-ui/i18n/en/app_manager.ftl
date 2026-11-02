@@ -86,3 +86,44 @@ leftovers-title = Leftover files
 leftovers-body = These files might be left behind. Send them to the trash?
 leftovers-trash = Move to trash
 leftovers-skip = Keep them
+
+detail-source = Source
+detail-available = Available version
+detail-update = Updates
+source-not-linked = Not linked
+source-link = Link repository
+source-edit = Edit source
+source-title = GitHub repository
+source-help = App Manager will check { $name } against the latest release of this repository.
+source-url-placeholder = https://github.com/owner/repo
+source-save = Save
+source-invalid = Enter a valid GitHub repository URL.
+source-saved = Source saved. Checking for updates…
+release-notes = Release notes
+
+update-check = Check
+update-check-all = Check all updates
+update-checking = Checking for updates…
+update-summary = { $count ->
+    [one] { $count } update available
+   *[other] { $count } updates available
+}
+update-all-current = All linked apps are up to date.
+update-check-failed = { $count ->
+    [one] { $count } check failed
+   *[other] { $count } checks failed
+}
+update-check-failed-short = Check failed
+update-unknown = Unknown
+update-unknown-summary = { $count ->
+    [one] { $count } version could not be compared
+   *[other] { $count } versions could not be compared
+}
+update-up-to-date = Up to date
+update-available = Update available
+update-badge = Update
+update-apply = Update
+update-title = Update
+update-running = Updating { $name }…
+update-failed = The update failed:
+update-none = No GitHub source is linked yet. Open an app's details to link one.

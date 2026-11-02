@@ -6,4 +6,7 @@ pub mod install;
 pub mod inventory;
 pub mod leftovers;
 pub mod real;
+pub mod registry;
 pub mod removal;
+pub mod updates;
+pub mod version;

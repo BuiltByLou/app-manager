@@ -12,12 +12,17 @@ use appmgr_core::leftovers::{Leftover, append_history, find_leftovers, trash_pat
 use appmgr_core::github::{Asset, AssetKind, Repo, Release, fetch_latest, installable_assets};
 use appmgr_core::real::RealProbe;
 use appmgr_core::install::{
-    applications_dir, cache_dir, download, install_appimage, install_deb, install_flatpak,
+    appimage_integration_paths, cache_dir, deb_package_name, download, install_appimage,
+    install_deb, install_flatpak, stable_appimage_path,
 };
+use appmgr_core::registry::{ManagedApp, Registry};
 use appmgr_core::removal::{
     RemovalPlan, authorize, is_authorized, keep_sudo_alive, plan_for, removal_command, run_removal,
 };
+use appmgr_core::updates::{UpdateCheck, UpdateStatus, evaluate};
+use appmgr_core::version;
 use prefs::Preferences;
+use std::collections::{HashMap, HashSet};
 use view_model::{Group, GroupKind, format_size, matching, protected_count, system_groups};
 
 const APP_ID: &str = "io.github.builtbylou.app_manager";
@@ -87,6 +92,18 @@ enum Dialog {
     Failed {
         error: String,
     },
+    /// Asks which GitHub repository an already installed app came from.
+    LinkSource {
+        app: InstalledApp,
+        url: String,
+        error: Option<String>,
+    },
+    Updating {
+        name: String,
+    },
+    UpdateFailed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -129,9 +146,29 @@ pub enum Message {
     SetConfirmRemovals(bool),
     MaintUrl(String),
     LoadRepo,
-    RepoLoaded(Result<Release, String>),
+    RepoLoaded(Result<(Repo, Release), String>),
     InstallAsset(AssetKind),
     AssetInstalled(Result<String, String>),
+    CheckUpdates,
+    CheckApp(usize),
+    UpdatesChecked(Vec<(String, UpdateCheck)>),
+    ApplyUpdate(usize),
+    Updated {
+        result: Result<UpdateDone, String>,
+    },
+    LinkSource(usize),
+    SourceUrl(String),
+    SaveSource,
+    OpenUrl(String),
+}
+
+/// What a finished update leaves behind for the UI.
+#[derive(Debug, Clone)]
+pub struct UpdateDone {
+    pub old_id: String,
+    pub new_id: String,
+    pub latest: String,
+    pub message: String,
 }
 
 pub struct AppManager {
@@ -164,6 +201,14 @@ pub struct AppManager {
     password: String,
     /// Persisted: ask before a quick removal.
     confirm_removals: bool,
+    /// GitHub source recorded for apps installed from a release.
+    registry: Registry,
+    /// Last update check per app id.
+    updates: HashMap<String, UpdateCheck>,
+    /// Apps with a check in flight.
+    checking_updates: HashSet<String>,
+    checking_all: bool,
+    update_note: String,
     /// Maintainer page state.
     maint_url: String,
     maint_repo: Option<Repo>,
@@ -223,6 +268,11 @@ impl Application for AppManager {
                 keepalive_started: false,
                 password: String::new(),
                 confirm_removals: Preferences::load().confirm_removals,
+                registry: Registry::load(),
+                updates: HashMap::new(),
+                checking_updates: HashSet::new(),
+                checking_all: false,
+                update_note: String::new(),
                 maint_url: String::new(),
                 maint_repo: None,
                 maint_release: None,
@@ -255,7 +305,16 @@ impl Application for AppManager {
                 self.menu = None;
                 load_inventory()
             }
-            Message::Loaded(apps) => {
+            Message::Loaded(mut apps) => {
+                // A managed AppImage uses a stable filename, so its version is
+                // not in the name anymore. The source registry still knows it.
+                for app in &mut apps {
+                    if let Some(managed) = self.registry.get(&app.id)
+                        && !managed.installed_version.is_empty()
+                    {
+                        app.version = Some(managed.installed_version.clone());
+                    }
+                }
                 self.apps = apps;
                 self.loading = false;
                 self.rebuild_app_text();
@@ -477,6 +536,10 @@ impl Application for AppManager {
             }
             Message::Removed { app, result } => match result {
                 Ok(items) => {
+                    self.registry.remove(&app.id);
+                    let _ = self.registry.save();
+                    self.updates.remove(&app.id);
+                    self.checking_updates.remove(&app.id);
                     if items.is_empty() {
                         if matches!(self.dialog, Some(Dialog::Running)) {
                             self.dialog = None;
@@ -545,7 +608,8 @@ impl Application for AppManager {
                     async move {
                         let repo = Repo::parse(&url)?;
                         let json = fetch_latest(&repo)?;
-                        Release::parse_json(&json)
+                        let release = Release::parse_json(&json)?;
+                        Ok((repo, release))
                     },
                     |result| cosmic::Action::App(Message::RepoLoaded(result)),
                 )
@@ -553,9 +617,10 @@ impl Application for AppManager {
             Message::RepoLoaded(result) => {
                 self.maint_working = false;
                 match result {
-                    Ok(release) => {
+                    Ok((repo, release)) => {
                         self.maint_status = format!("Loaded {}", release.tag);
                         self.maint_assets = installable_assets(&release);
+                        self.maint_repo = Some(repo);
                         self.maint_release = Some(release);
                     }
                     Err(error) => {
@@ -569,37 +634,183 @@ impl Application for AppManager {
                     self.maint_status = "No asset of that kind found.".to_owned();
                     return Task::none();
                 };
+                let (Some(repo), Some(release)) =
+                    (self.maint_repo.clone(), self.maint_release.clone())
+                else {
+                    self.maint_status = "Load a repository first.".to_owned();
+                    return Task::none();
+                };
                 self.maint_working = true;
                 self.maint_status = format!("Downloading {}…", asset.name);
                 Task::perform(
-                    async move {
-                        let destination = cache_dir().join(&asset.name);
-                        let installed = download(&asset.url, &destination).and_then(|()| {
-                            match asset.kind {
-                                AssetKind::Deb => install_deb(&destination),
-                                AssetKind::Flatpak => install_flatpak(&destination),
-                                AssetKind::AppImage => {
-                                    let target = applications_dir().join(&asset.name);
-                                    install_appimage(&destination, &target)
-                                }
-                                AssetKind::Other => Ok(()),
-                            }
-                        });
-                        // The download is only a means to install; do not leave
-                        // a second copy of the package behind.
-                        let _ = std::fs::remove_file(&destination);
-                        installed?;
-                        Ok(format!("Installed {}", asset.name))
-                    },
+                    async move { install_asset(&repo, &release, &asset) },
                     |result| cosmic::Action::App(Message::AssetInstalled(result)),
                 )
             }
             Message::AssetInstalled(result) => {
                 self.maint_working = false;
                 match result {
-                    Ok(message) => self.maint_status = message,
-                    Err(error) => self.maint_status = error,
+                    Ok(message) => {
+                        self.maint_status = message;
+                        load_inventory()
+                    }
+                    Err(error) => {
+                        self.maint_status = error;
+                        Task::none()
+                    }
                 }
+            }
+            Message::CheckUpdates => {
+                let entries = self.managed_entries();
+                if entries.is_empty() {
+                    self.update_note = fl!("update-none");
+                    return Task::none();
+                }
+                self.checking_all = true;
+                for (id, _) in &entries {
+                    self.checking_updates.insert(id.clone());
+                }
+                self.update_note = fl!("update-checking");
+                check_updates(entries)
+            }
+            Message::CheckApp(index) => {
+                let Some(app) = self.apps.get(index) else {
+                    return Task::none();
+                };
+                let Some(managed) = self.registry.get(&app.id).cloned() else {
+                    return Task::none();
+                };
+                self.checking_updates.insert(app.id.clone());
+                self.update_note = fl!("update-checking");
+                check_updates(vec![(app.id.clone(), managed)])
+            }
+            Message::UpdatesChecked(results) => {
+                for (id, check) in &results {
+                    self.checking_updates.remove(id);
+                    self.updates.insert(id.clone(), check.clone());
+                }
+                self.checking_all = !self.checking_updates.is_empty();
+                self.update_note = self.update_summary();
+                Task::none()
+            }
+            Message::ApplyUpdate(index) => {
+                let Some(app) = self.apps.get(index).cloned() else {
+                    return Task::none();
+                };
+                let Some(managed) = self.registry.get(&app.id).cloned() else {
+                    return Task::none();
+                };
+                let Some(check) = self.updates.get(&app.id).cloned() else {
+                    return Task::none();
+                };
+                let (Some(asset), Some(latest)) = (check.asset.clone(), check.latest.clone())
+                else {
+                    self.dialog = Some(Dialog::UpdateFailed {
+                        error: "No installable asset was found for this release.".to_owned(),
+                    });
+                    return Task::none();
+                };
+                self.dialog = Some(Dialog::Updating {
+                    name: app.name.clone(),
+                });
+                update_app(app, managed, asset, latest)
+            }
+            Message::Updated { result } => match result {
+                Ok(done) => {
+                    self.dialog = None;
+                    self.update_note = done.message.clone();
+                    self.updates.remove(&done.old_id);
+                    self.checking_updates.remove(&done.old_id);
+                    self.updates.insert(
+                        done.new_id.clone(),
+                        UpdateCheck {
+                            installed: Some(done.latest.clone()),
+                            latest: Some(done.latest.clone()),
+                            status: UpdateStatus::UpToDate,
+                            asset: None,
+                            error: None,
+                        },
+                    );
+                    self.selected = Some(done.new_id.clone());
+                    self.detail = Some(done.new_id);
+                    self.loading = true;
+                    load_inventory()
+                }
+                Err(error) => {
+                    self.dialog = Some(Dialog::UpdateFailed { error });
+                    Task::none()
+                }
+            },
+            Message::LinkSource(index) => {
+                let Some(app) = self.apps.get(index).cloned() else {
+                    return Task::none();
+                };
+                let url = self
+                    .registry
+                    .get(&app.id)
+                    .map(|managed| format!("https://github.com/{}", managed.repo))
+                    .unwrap_or_default();
+                self.dialog = Some(Dialog::LinkSource {
+                    app,
+                    url,
+                    error: None,
+                });
+                Task::none()
+            }
+            Message::SourceUrl(url) => {
+                if let Some(Dialog::LinkSource {
+                    url: current,
+                    error,
+                    ..
+                }) = &mut self.dialog
+                {
+                    *current = url;
+                    *error = None;
+                }
+                Task::none()
+            }
+            Message::SaveSource => {
+                let Some(Dialog::LinkSource { app, url, .. }) = self.dialog.take() else {
+                    return Task::none();
+                };
+                let repo = match Repo::parse(&url) {
+                    Ok(repo) => repo,
+                    Err(_) => {
+                        self.dialog = Some(Dialog::LinkSource {
+                            app,
+                            url,
+                            error: Some(fl!("source-invalid")),
+                        });
+                        return Task::none();
+                    }
+                };
+                let managed = ManagedApp {
+                    repo: repo.slug(),
+                    format: managed_kind(app.origin).as_str().to_owned(),
+                    asset: self
+                        .registry
+                        .get(&app.id)
+                        .map(|managed| managed.asset.clone())
+                        .unwrap_or_default(),
+                    installed_version: app.version.clone().unwrap_or_default(),
+                    package: app.package.clone(),
+                    path: appimage_path(&app),
+                };
+                self.registry.insert(app.id.clone(), managed.clone());
+                if let Err(error) = self.registry.save() {
+                    self.dialog = Some(Dialog::LinkSource {
+                        app,
+                        url,
+                        error: Some(error),
+                    });
+                    return Task::none();
+                }
+                self.update_note = fl!("source-saved");
+                self.checking_updates.insert(app.id.clone());
+                check_updates(vec![(app.id.clone(), managed)])
+            }
+            Message::OpenUrl(url) => {
+                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 Task::none()
             }
         }
@@ -607,7 +818,28 @@ impl Application for AppManager {
 
     fn view(&self) -> Element<'_, Message> {
         let page = self.page();
-        let mut content = widget::column![text::title3(page.title())].spacing(12);
+        let check_label = if self.checking_all {
+            fl!("update-checking")
+        } else {
+            fl!("update-check-all")
+        };
+        let check = if self.checking_all {
+            button::standard(check_label)
+        } else {
+            button::standard(check_label).on_press(Message::CheckUpdates)
+        };
+        let header = widget::row![
+            text::title3(page.title()),
+            widget::Space::new().width(Length::Fill),
+            check,
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+
+        let mut content = widget::column![header].spacing(12);
+        if !self.update_note.is_empty() {
+            content = content.push(text::caption(self.update_note.clone()));
+        }
 
         if matches!(page, Page::User | Page::System) {
             content = content.push(self.search_row());
@@ -672,6 +904,48 @@ impl AppManager {
     fn rebuild_app_text(&mut self) {
         self.subtitles = self.apps.iter().map(subtitle).collect();
         self.icons = self.apps.iter().map(app_icon).collect();
+    }
+
+    /// Registered sources that still match an app in the inventory.
+    fn managed_entries(&self) -> Vec<(String, ManagedApp)> {
+        let installed: HashSet<&str> = self.apps.iter().map(|app| app.id.as_str()).collect();
+        self.registry
+            .apps
+            .iter()
+            .filter(|(id, _)| installed.contains(id.as_str()))
+            .map(|(id, managed)| (id.clone(), managed.clone()))
+            .collect()
+    }
+
+    fn update_summary(&self) -> String {
+        let available = self
+            .updates
+            .values()
+            .filter(|check| check.status == UpdateStatus::Available)
+            .count();
+        let failed = self
+            .updates
+            .values()
+            .filter(|check| check.status == UpdateStatus::Failed)
+            .count();
+        let unknown = self
+            .updates
+            .values()
+            .filter(|check| check.status == UpdateStatus::Unknown)
+            .count();
+        if available > 0 {
+            fl!("update-summary", count = (available as i64))
+        } else if failed > 0 {
+            fl!("update-check-failed", count = (failed as i64))
+        } else if unknown > 0 {
+            fl!("update-unknown-summary", count = (unknown as i64))
+        } else {
+            fl!("update-all-current")
+        }
+    }
+
+    fn is_checking(&self, id: &str) -> bool {
+        self.checking_updates.contains(id)
     }
 
     /// Whether an app is currently listed on the page it belongs to.
@@ -785,6 +1059,9 @@ impl AppManager {
             index,
             self.is_selected(&app.id),
             self.is_menu_open(&app.id),
+            self.updates
+                .get(&app.id)
+                .is_some_and(|check| check.status == UpdateStatus::Available),
         )
     }
 
@@ -970,6 +1247,41 @@ impl AppManager {
                         button::standard(fl!("remove-close")).on_press(Message::CancelDialog),
                     );
             }
+            Dialog::LinkSource { app, url, error } => {
+                let input: Element<'_, Message> =
+                    widget::text_input(fl!("source-url-placeholder"), url)
+                        .on_input(Message::SourceUrl)
+                        .on_submit(|_| Message::SaveSource)
+                        .into();
+                window = window
+                    .title(fl!("source-title"))
+                    .body(fl!("source-help", name = app.name.clone()))
+                    .control(input);
+                if let Some(error) = error {
+                    window = window.control(text::caption(error.clone()));
+                }
+                window = window
+                    .primary_action(
+                        button::suggested(fl!("source-save")).on_press(Message::SaveSource),
+                    )
+                    .secondary_action(
+                        button::standard(fl!("remove-cancel")).on_press(Message::CancelDialog),
+                    );
+            }
+            Dialog::Updating { name } => {
+                window = window
+                    .title(fl!("update-title"))
+                    .body(fl!("update-running", name = name.clone()));
+            }
+            Dialog::UpdateFailed { error } => {
+                window = window
+                    .title(fl!("update-title"))
+                    .body(fl!("update-failed"))
+                    .control(text::caption(error.clone()))
+                    .primary_action(
+                        button::standard(fl!("remove-close")).on_press(Message::CancelDialog),
+                    );
+            }
         }
 
         Some(window.into())
@@ -1016,7 +1328,7 @@ impl AppManager {
                     AssetKind::Other => continue,
                 };
                 buttons = buttons.push(
-                    button::standard(label).on_press(Message::InstallAsset(asset.kind.clone())),
+                    button::standard(label).on_press(Message::InstallAsset(asset.kind)),
                 );
             }
             card = card.push(buttons);
@@ -1042,6 +1354,22 @@ impl AppManager {
         content = content.push(text::title2(app.name.clone()));
         let mut fields = widget::column![].spacing(10);
         fields = fields.push(field(fl!("detail-version"), version_label(app)));
+        let managed = self.registry.get(&app.id);
+        fields = fields.push(field(
+            fl!("detail-source"),
+            managed
+                .map(|managed| managed.repo.clone())
+                .unwrap_or_else(|| fl!("source-not-linked")),
+        ));
+        if let Some(check) = self.updates.get(&app.id) {
+            if let Some(latest) = &check.latest {
+                fields = fields.push(field(
+                    fl!("detail-available"),
+                    version::display(latest).to_owned(),
+                ));
+            }
+            fields = fields.push(field(fl!("detail-update"), update_status_label(check)));
+        }
         fields = fields.push(field(fl!("detail-origin"), origin_label(app.origin)));
         fields = fields.push(field(fl!("detail-size"), format_size(app.size_bytes)));
         if let Some(package) = &app.package {
@@ -1056,6 +1384,49 @@ impl AppManager {
             },
         ));
         content = content.push(fields);
+
+        let mut source_actions = widget::row![].spacing(8);
+        if let Some(managed) = managed {
+            source_actions = source_actions.push(
+                button::link(managed.repo.clone()).on_press(Message::OpenUrl(format!(
+                    "https://github.com/{}",
+                    managed.repo
+                ))),
+            );
+            source_actions =
+                source_actions.push(button::text(fl!("source-edit")).on_press(Message::LinkSource(index)));
+            if self.is_checking(&app.id) {
+                source_actions = source_actions.push(button::standard(fl!("update-checking")));
+            } else {
+                source_actions = source_actions
+                    .push(button::text(fl!("update-check")).on_press(Message::CheckApp(index)));
+            }
+        } else {
+            source_actions = source_actions
+                .push(button::standard(fl!("source-link")).on_press(Message::LinkSource(index)));
+        }
+        content = content.push(source_actions);
+
+        if let Some(check) = self.updates.get(&app.id) {
+            if check.asset.is_some()
+                && matches!(check.status, UpdateStatus::Available | UpdateStatus::Unknown)
+            {
+                content = content.push(
+                    button::suggested(fl!("update-apply")).on_press(Message::ApplyUpdate(index)),
+                );
+            }
+            if let (Some(latest), Some(managed)) = (&check.latest, managed)
+                && let Ok(repo) = Repo::parse(&managed.repo)
+            {
+                content = content.push(
+                    button::link(fl!("release-notes"))
+                        .on_press(Message::OpenUrl(repo.release_url(latest))),
+                );
+            }
+            if let Some(error) = &check.error {
+                content = content.push(text::caption(error.clone()));
+            }
+        }
 
         let remove = if app.protected {
             widget::column![
@@ -1269,6 +1640,7 @@ fn app_row<'a>(
     index: usize,
     selected: bool,
     menu_open: bool,
+    update_available: bool,
 ) -> Element<'a, Message> {
     let icon = widget::icon::icon(icon).size(32);
 
@@ -1284,6 +1656,13 @@ fn app_row<'a>(
         .align_y(Alignment::Center);
     if app.protected {
         row = row.push(widget::icon::from_name("changes-prevent-symbolic").size(16));
+    }
+    if update_available {
+        row = row.push(
+            container(text::caption(fl!("update-badge")))
+                .padding([2, 8])
+                .class(cosmic::theme::Container::Card),
+        );
     }
 
     let menu_icon = button::icon(widget::icon::from_name("open-menu-symbolic").size(16))
@@ -1375,6 +1754,224 @@ fn origin_label(origin: Origin) -> String {
 
 fn version_label(app: &InstalledApp) -> String {
     app.version
-        .clone()
+        .as_deref()
+        .map(version::display)
+        .map(str::to_owned)
         .unwrap_or_else(|| fl!("unknown-version"))
+}
+
+fn managed_kind(origin: Origin) -> AssetKind {
+    match origin {
+        Origin::Apt => AssetKind::Deb,
+        Origin::Flatpak => AssetKind::Flatpak,
+        Origin::AppImage => AssetKind::AppImage,
+    }
+}
+
+fn appimage_path(app: &InstalledApp) -> Option<String> {
+    if app.origin == Origin::AppImage {
+        app.id.strip_prefix("appimage:").map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+fn update_status_label(check: &UpdateCheck) -> String {
+    match check.status {
+        UpdateStatus::Unknown => fl!("update-unknown"),
+        UpdateStatus::UpToDate => fl!("update-up-to-date"),
+        UpdateStatus::Available => fl!("update-available"),
+        UpdateStatus::Failed => fl!("update-check-failed-short"),
+    }
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// Checks every registered source, in order. A failed repository is reported
+/// for that app only; the rest still get checked.
+fn check_updates(entries: Vec<(String, ManagedApp)>) -> Task<Message> {
+    Task::perform(
+        async move {
+            entries
+                .into_iter()
+                .map(|(id, managed)| (id, check_entry(&managed)))
+                .collect::<Vec<_>>()
+        },
+        |results| cosmic::Action::App(Message::UpdatesChecked(results)),
+    )
+}
+
+fn check_entry(managed: &ManagedApp) -> UpdateCheck {
+    let installed = (!managed.installed_version.is_empty())
+        .then_some(managed.installed_version.as_str());
+    let Some(kind) = AssetKind::parse(&managed.format) else {
+        return UpdateCheck::failed(installed, "unknown install format".to_owned());
+    };
+    let repo = match Repo::parse(&managed.repo) {
+        Ok(repo) => repo,
+        Err(error) => return UpdateCheck::failed(installed, error),
+    };
+    let release = match fetch_latest(&repo).and_then(|json| Release::parse_json(&json)) {
+        Ok(release) => release,
+        Err(error) => return UpdateCheck::failed(installed, error),
+    };
+    let previous = (!managed.asset.is_empty()).then_some(managed.asset.as_str());
+    evaluate(installed, &release, &kind, previous)
+}
+
+/// Downloads and installs a release asset, and records where it came from.
+fn install_asset(repo: &Repo, release: &Release, asset: &Asset) -> Result<String, String> {
+    let destination = cache_dir().join(&asset.name);
+    let outcome = (|| -> Result<(String, ManagedApp), String> {
+        download(&asset.url, &destination)?;
+        let (id, package, path) = match asset.kind {
+            AssetKind::Deb => {
+                let package = deb_package_name(&destination)?;
+                install_deb(&destination)?;
+                (format!("apt:{package}"), Some(package), None)
+            }
+            AssetKind::AppImage => {
+                let target = stable_appimage_path(&repo.name);
+                install_appimage(&destination, &target)?;
+                (
+                    format!("appimage:{}", target.display()),
+                    None,
+                    Some(target.display().to_string()),
+                )
+            }
+            AssetKind::Flatpak => {
+                let package = install_flatpak(&destination)?;
+                (format!("flatpak:{package}"), Some(package), None)
+            }
+            AssetKind::Other => return Err("this asset cannot be installed".to_owned()),
+        };
+        let managed = ManagedApp {
+            repo: repo.slug(),
+            format: asset.kind.as_str().to_owned(),
+            asset: asset.name.clone(),
+            installed_version: release.tag.clone(),
+            package,
+            path,
+        };
+        Ok((id, managed))
+    })();
+    // The download is only a means to install; do not leave a second copy.
+    let _ = std::fs::remove_file(&destination);
+    let (id, managed) = outcome?;
+
+    let mut registry = Registry::load();
+    registry.insert(id, managed);
+    let note = match registry.save() {
+        Ok(()) => String::new(),
+        Err(error) => format!(" (the source could not be saved: {error})"),
+    };
+    Ok(format!("Installed {}{note}", asset.name))
+}
+
+/// Applies an update in place, keeping user data and the same install format.
+fn update_app(
+    app: InstalledApp,
+    managed: ManagedApp,
+    asset: Asset,
+    latest: String,
+) -> Task<Message> {
+    Task::perform(
+        async move { apply_update(&app, &managed, &asset, &latest) },
+        |result| cosmic::Action::App(Message::Updated { result }),
+    )
+}
+
+fn apply_update(
+    app: &InstalledApp,
+    managed: &ManagedApp,
+    asset: &Asset,
+    latest: &str,
+) -> Result<UpdateDone, String> {
+    let repo = Repo::parse(&managed.repo)?;
+    let destination = cache_dir().join(&asset.name);
+    let outcome = (|| -> Result<(String, ManagedApp), String> {
+        download(&asset.url, &destination)?;
+        let (new_id, package, path) = match asset.kind {
+            AssetKind::Deb => {
+                let package = deb_package_name(&destination)?;
+                if let Some(previous) = &managed.package
+                    && previous != &package
+                {
+                    return Err(format!(
+                        "the package name changed from {previous} to {package}; update it by hand"
+                    ));
+                }
+                install_deb(&destination)?;
+                (format!("apt:{package}"), Some(package), None)
+            }
+            AssetKind::AppImage => {
+                let target = stable_appimage_path(&repo.name);
+                install_appimage(&destination, &target)?;
+                (
+                    format!("appimage:{}", target.display()),
+                    None,
+                    Some(target.display().to_string()),
+                )
+            }
+            AssetKind::Flatpak => {
+                let package = install_flatpak(&destination)?;
+                (format!("flatpak:{package}"), Some(package), None)
+            }
+            AssetKind::Other => return Err("this asset cannot be installed".to_owned()),
+        };
+        let mut next = managed.clone();
+        next.asset = asset.name.clone();
+        next.installed_version = latest.to_owned();
+        next.package = package;
+        next.path = path;
+        Ok((new_id, next))
+    })();
+    let _ = std::fs::remove_file(&destination);
+    let (new_id, next) = outcome?;
+
+    // Only after the new AppImage is in place does the old integration go to
+    // the trash. If anything failed above, the previous app is untouched.
+    if asset.kind == AssetKind::AppImage {
+        let old_path = managed
+            .path
+            .clone()
+            .or_else(|| app.id.strip_prefix("appimage:").map(str::to_owned));
+        if let Some(old_path) = old_path
+            && next.path.as_deref() != Some(old_path.as_str())
+        {
+            let paths: Vec<String> =
+                appimage_integration_paths(std::path::Path::new(&old_path), &home_dir())
+                    .into_iter()
+                    .filter(|path| path.exists())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+            let _ = trash_paths(&paths);
+        }
+    }
+
+    let mut registry = Registry::load();
+    if new_id != app.id {
+        registry.remove(&app.id);
+    }
+    registry.insert(new_id.clone(), next);
+    let note = match registry.save() {
+        Ok(()) => String::new(),
+        Err(error) => format!(" (the source could not be saved: {error})"),
+    };
+    append_history(&home_dir(), &app.name, "GitHub", "updated");
+
+    Ok(UpdateDone {
+        old_id: app.id.clone(),
+        new_id,
+        latest: latest.to_owned(),
+        message: format!(
+            "Updated {} to {}{note}",
+            app.name,
+            version::display(latest)
+        ),
+    })
 }
