@@ -81,8 +81,8 @@ exit 0
 EOF
 chmod 755 "$stage/DEBIAN/postrm"
 
-mkdir -p target/deb
-out="target/deb/${name}_${version}_${arch}.deb"
+mkdir -p dist
+out="dist/${name}_${version}_${arch}.deb"
 dpkg-deb --build --root-owner-group "$stage" "$out" >/dev/null
 echo "built $out"
 dpkg-deb --info "$out" | sed -n '1,12p'
