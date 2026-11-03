@@ -180,7 +180,7 @@ checksum = "f47b57fc4521e3cae26a4d45b5227f8fadee4c345be0fefd8d5d1711afb8aeb9"
 
 [[package]]
 name = "appmgr"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "appmgr-core",
  "i18n-embed",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "appmgr-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
