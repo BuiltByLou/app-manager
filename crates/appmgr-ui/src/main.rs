@@ -34,10 +34,9 @@ fn main() -> cosmic::iced::Result {
 
 fn source_tag_label(tag: SourceTag) -> String {
     match tag {
-        SourceTag::Deb => fl!("tag-deb"),
-        SourceTag::Flatpak => fl!("tag-flatpak"),
-        SourceTag::AppImage => fl!("tag-appimage"),
+        SourceTag::Hub => fl!("tag-hub"),
         SourceTag::GitHub => fl!("tag-github"),
+        SourceTag::Local => fl!("tag-local"),
     }
 }
 
@@ -1080,10 +1079,9 @@ impl AppManager {
         let mut sources = widget::row![].spacing(6);
         sources = sources.push(self.source_chip(None, fl!("tag-any-source")));
         for (tag, label) in [
-            (SourceTag::Deb, fl!("tag-deb")),
-            (SourceTag::Flatpak, fl!("tag-flatpak")),
-            (SourceTag::AppImage, fl!("tag-appimage")),
+            (SourceTag::Hub, fl!("tag-hub")),
             (SourceTag::GitHub, fl!("tag-github")),
+            (SourceTag::Local, fl!("tag-local")),
         ] {
             sources = sources.push(self.source_chip(Some(tag), label));
         }
@@ -1430,11 +1428,14 @@ impl AppManager {
         let mut fields = widget::column![].spacing(10);
         fields = fields.push(field(fl!("detail-version"), version_label(app)));
         let managed = self.registry.get(&app.id);
+        let tag = source_tag(app, managed.is_some());
         fields = fields.push(field(
             fl!("detail-source"),
-            managed
-                .map(|managed| managed.repo.clone())
-                .unwrap_or_else(|| fl!("source-not-linked")),
+            match (managed, tag) {
+                (Some(managed), _) => managed.repo.clone(),
+                (None, SourceTag::Hub) => fl!("source-hub"),
+                (None, _) => fl!("source-not-linked"),
+            },
         ));
         if let Some(check) = self.updates.get(&app.id) {
             if let Some(latest) = &check.latest {
@@ -1460,33 +1461,40 @@ impl AppManager {
         ));
         content = content.push(fields);
 
+        // A hub app is updated by apt or Flathub, so it has nothing to link.
+        // A GitHub app can be re-pointed; a local file can be linked to start
+        // receiving updates here.
         let mut source_actions = widget::row![].spacing(8);
-        let mut has_source = false;
-        if managed.is_some() || app.origin == Origin::AppImage {
-            if let Some(managed) = managed {
+        match (tag, managed) {
+            (SourceTag::Hub, _) => {
+                content = content.push(text::caption(fl!("source-hub-note")));
+            }
+            (SourceTag::GitHub, Some(managed)) => {
                 source_actions = source_actions.push(
                     button::link(managed.repo.clone()).on_press(Message::OpenUrl(format!(
                         "https://github.com/{}",
                         managed.repo
                     ))),
                 );
-                source_actions =
-                    source_actions.push(button::text(fl!("source-edit")).on_press(Message::LinkSource(index)));
+                source_actions = source_actions
+                    .push(button::text(fl!("source-edit")).on_press(Message::LinkSource(index)));
                 if self.is_checking(&app.id) {
                     source_actions = source_actions.push(button::standard(fl!("update-checking")));
                 } else {
                     source_actions = source_actions
                         .push(button::text(fl!("update-check")).on_press(Message::CheckApp(index)));
                 }
-                has_source = true;
-            } else {
-                source_actions = source_actions
-                    .push(button::standard(fl!("source-link")).on_press(Message::LinkSource(index)));
-                has_source = true;
+                content = content.push(source_actions);
             }
-        }
-        if has_source {
-            content = content.push(source_actions);
+            _ => {
+                content = content
+                    .push(text::caption(fl!("source-local-note")));
+                content = content.push(
+                    widget::row![button::standard(fl!("source-link"))
+                        .on_press(Message::LinkSource(index))]
+                    .spacing(8),
+                );
+            }
         }
 
         if let Some(check) = self.updates.get(&app.id) {

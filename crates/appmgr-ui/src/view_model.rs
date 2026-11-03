@@ -1,25 +1,27 @@
 use appmgr_core::inventory::{App, InstallKind, Origin};
 
-/// Where an app came from, as the second tag on a row. GitHub wins over the
-/// package format, because that is what makes the app updatable.
+/// Who keeps an app up to date. This is what decides whether the app needs a
+/// repository linked at all: a public hub already does it, while a file that
+/// came from nowhere can only be updated once it points at one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceTag {
-    Deb,
-    Flatpak,
-    AppImage,
+    /// apt or Flathub: the system's own update path.
+    Hub,
+    /// Installed by App Manager from a GitHub release.
     GitHub,
+    /// A file on this machine with no hub and no repository (an AppImage).
+    Local,
 }
 
-/// Which source tag an app carries. `managed` says whether the app has a
-/// GitHub source recorded, which the inventory alone cannot know.
+/// Which source tag an app carries. `managed` says whether a GitHub source is
+/// recorded for it, which the inventory alone cannot know.
 pub fn source_tag(app: &App, managed: bool) -> SourceTag {
     if managed {
         return SourceTag::GitHub;
     }
     match app.origin {
-        Origin::Apt => SourceTag::Deb,
-        Origin::Flatpak => SourceTag::Flatpak,
-        Origin::AppImage => SourceTag::AppImage,
+        Origin::AppImage => SourceTag::Local,
+        Origin::Apt | Origin::Flatpak => SourceTag::Hub,
     }
 }
 
@@ -148,20 +150,35 @@ mod tests {
     }
 
     #[test]
-    fn filters_by_source() {
+    fn a_hub_app_is_one_apt_or_flatpak_keeps() {
         let apps = sample();
-        let rows = visible_rows(&apps, "", None, Some(SourceTag::Flatpak), none_managed);
-        assert_eq!(names(&apps, &rows), vec!["brave"]);
+        let rows = visible_rows(&apps, "", None, Some(SourceTag::Hub), none_managed);
+        assert_eq!(
+            names(&apps, &rows),
+            vec!["brave", "Driver", "Firefox", "zsh"],
+            "an apt package the user added is still updated by apt"
+        );
     }
 
     #[test]
-    fn github_wins_over_the_package_format() {
+    fn an_unmanaged_appimage_is_local() {
+        let apps = sample();
+        let rows = visible_rows(&apps, "", None, Some(SourceTag::Local), none_managed);
+        assert_eq!(names(&apps, &rows), vec!["Tool"]);
+        assert_eq!(
+            source_tag(apps.iter().find(|app| app.name == "Tool").unwrap(), false),
+            SourceTag::Local
+        );
+    }
+
+    #[test]
+    fn github_wins_over_where_the_package_came_from() {
         let apps = sample();
         let managed = |app: &App| app.name == "zsh";
         let rows = visible_rows(&apps, "", None, Some(SourceTag::GitHub), managed);
         assert_eq!(names(&apps, &rows), vec!["zsh"]);
-        let rows = visible_rows(&apps, "", None, Some(SourceTag::Deb), managed);
-        assert_eq!(names(&apps, &rows), vec!["Driver", "Firefox"]);
+        let rows = visible_rows(&apps, "", None, Some(SourceTag::Hub), managed);
+        assert_eq!(names(&apps, &rows), vec!["brave", "Driver", "Firefox"]);
     }
 
     #[test]
@@ -171,7 +188,7 @@ mod tests {
             &apps,
             "o",
             Some(InstallKind::User),
-            Some(SourceTag::AppImage),
+            Some(SourceTag::Local),
             none_managed,
         );
         assert_eq!(names(&apps, &rows), vec!["Tool"]);
