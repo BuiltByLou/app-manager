@@ -1,4 +1,4 @@
-use appmgr_core::inventory::{App, InstallKind, Origin};
+use appmgr_core::inventory::{App, InstallKind};
 
 /// Who keeps an app up to date. This is what decides whether the app needs a
 /// repository linked at all: a public hub already does it, while a file that
@@ -13,15 +13,16 @@ pub enum SourceTag {
     Local,
 }
 
-/// Which source tag an app carries. `managed` says whether a GitHub source is
-/// recorded for it, which the inventory alone cannot know.
+/// Which source tag an app carries. A recorded GitHub source wins, because it
+/// is the only channel this app manages. Otherwise the inventory's `hub` flag
+/// decides: a repository that can update the app, or a file nothing updates.
 pub fn source_tag(app: &App, managed: bool) -> SourceTag {
     if managed {
-        return SourceTag::GitHub;
-    }
-    match app.origin {
-        Origin::AppImage => SourceTag::Local,
-        Origin::Apt | Origin::Flatpak => SourceTag::Hub,
+        SourceTag::GitHub
+    } else if app.hub {
+        SourceTag::Hub
+    } else {
+        SourceTag::Local
     }
 }
 
@@ -81,6 +82,7 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use appmgr_core::inventory::Origin;
 
     fn app(name: &str, kind: InstallKind, origin: Origin) -> App {
         App {
@@ -94,6 +96,7 @@ mod tests {
             icon: None,
             origin,
             kind,
+            hub: origin != Origin::AppImage,
             protected: false,
             size_bytes: 0,
             package: Some(name.to_owned()),
@@ -169,6 +172,14 @@ mod tests {
             source_tag(apps.iter().find(|app| app.name == "Tool").unwrap(), false),
             SourceTag::Local
         );
+    }
+
+    #[test]
+    fn an_apt_package_without_a_remote_origin_is_local() {
+        let mut app_manager = app("app-manager", InstallKind::User, Origin::Apt);
+        app_manager.hub = false;
+        assert_eq!(source_tag(&app_manager, false), SourceTag::Local);
+        assert_eq!(source_tag(&app_manager, true), SourceTag::GitHub);
     }
 
     #[test]

@@ -95,6 +95,50 @@ pub fn parse_relations(text: &str) -> HashSet<String> {
 }
 
 
+/// Reads the packages whose installed version comes from a remote repository,
+/// as reported by `apt-cache policy`.
+///
+/// A package installed from a local file has only `/var/lib/dpkg/status` in
+/// its version table. A repository package also lists the repository it came
+/// from, which is what tells the two apart.
+pub fn parse_apt_policy(text: &str) -> HashSet<String> {
+    let mut remote = HashSet::new();
+    let mut current: Option<&str> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // "name:" starts a package block; everything indented belongs to it.
+        if !line.starts_with(char::is_whitespace) {
+            current = trimmed.strip_suffix(':');
+            continue;
+        }
+        let Some(name) = current else {
+            continue;
+        };
+        if is_remote_origin(trimmed) {
+            remote.insert(name.to_owned());
+        }
+    }
+
+    remote
+}
+
+/// A `apt-cache policy` origin line is `<priority> <uri> <suite> …`, or
+/// `<priority> /var/lib/dpkg/status` for a package with no repository.
+fn is_remote_origin(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some(_priority) = fields.next() else {
+        return false;
+    };
+    let Some(uri) = fields.next() else {
+        return false;
+    };
+    uri.starts_with("http://") || uri.starts_with("https://") || uri.starts_with("ftp://")
+}
+
 /// Lê a saída de `apt-mark showmanual`: um pacote por linha.
 pub fn parse_apt_mark_manual(text: &str) -> HashSet<String> {
     text.lines()
@@ -114,6 +158,41 @@ libc6:amd64	2.39-0ubuntu8.6	13000	install ok installed	no	optional
 bash	5.2.21-2ubuntu4	2000	install ok installed	yes	required
 vim	2:9.1.0016-1ubuntu7	4000	deinstall ok config-files	no	optional
 ";
+
+    const POLICY: &str = "\
+app-manager:
+  Installed: 0.0.5
+  Candidate: 0.0.5
+  Version table:
+ *** 0.0.5 100
+        100 /var/lib/dpkg/status
+firefox:
+  Installed: 1:158.0.1
+  Candidate: 1:158.0.1
+  Version table:
+ *** 1:158.0.1 1001
+       1001 http://apt.pop-os.org/release noble/main amd64 Packages
+        500 http://apt.pop-os.org/ubuntu noble/main amd64 Packages
+local-tool:
+  Installed: 1.2.3
+  Candidate: 1.2.3
+  Version table:
+ *** 1.2.3 100
+        100 /var/lib/dpkg/status
+";
+
+    #[test]
+    fn reads_only_packages_that_come_from_a_remote_repository() {
+        let remote = parse_apt_policy(POLICY);
+        assert!(remote.contains("firefox"));
+        assert!(!remote.contains("app-manager"));
+        assert!(!remote.contains("local-tool"));
+    }
+
+    #[test]
+    fn an_empty_policy_has_no_remote_packages() {
+        assert!(parse_apt_policy("").is_empty());
+    }
 
     const MANUAL: &str = "\
 firefox

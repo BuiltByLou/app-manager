@@ -137,6 +137,20 @@ impl SystemProbe for RealProbe {
             .collect()
     }
 
+    fn packages_with_remote_origin(&self, packages: &[String]) -> HashSet<String> {
+        let mut remote = HashSet::new();
+        for chunk in packages.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let out = run(Command::new("apt-cache").arg("policy").args(chunk));
+            if let Some(out) = out {
+                remote.extend(crate::dpkg::parse_apt_policy(&out));
+            }
+        }
+        remote
+    }
+
     fn which(&self, program: &str) -> Option<PathBuf> {
         if let Some(path) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path) {
@@ -160,8 +174,15 @@ impl SystemProbe for RealProbe {
         ]))
         .map(|out| parse_flatpak_list(&out))
         .unwrap_or_default();
+        let remotes = run(Command::new("flatpak").args([
+            "remotes",
+            "--columns=name,url",
+        ]))
+        .map(|out| crate::flatpak::parse_remote_names(&out))
+        .unwrap_or_default();
         for app in &mut apps {
             app.icon = crate::flatpak_icon::find_icon(&app.id);
+            app.from_remote = remotes.contains(&app.origin);
         }
         apps
     }

@@ -8,6 +8,10 @@ pub struct FlatpakApp {
     pub size_bytes: u64,
     /// Absolute path to an icon file, when one can be found.
     pub icon: Option<String>,
+    /// Whether `origin` is a configured remote with a network URL, which means
+    /// the app can be updated from there. A sideloaded bundle has no such
+    /// remote, even though it lists an origin.
+    pub from_remote: bool,
 }
 
 /// Lê a saída de:
@@ -35,7 +39,25 @@ pub fn parse_flatpak_list(text: &str) -> Vec<FlatpakApp> {
                 user_installation: installation.eq_ignore_ascii_case("user"),
                 size_bytes: parse_flatpak_size(size),
                 icon: None,
+                from_remote: false,
             })
+        })
+        .collect()
+}
+
+/// Reads `flatpak remotes --columns=name,url` and returns the remote names
+/// that point at the network. A local or offline remote cannot update anything,
+/// so its apps are not "hub" apps.
+pub fn parse_remote_names(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?.trim();
+            let url = fields.next().unwrap_or("").trim();
+            let remote = url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("ftp://");
+            (remote && !name.is_empty()).then(|| name.to_owned())
         })
         .collect()
 }
@@ -92,6 +114,15 @@ org.gnome.Builder	Builder	46.1	flathub	system	1.4?GB
         let builder = apps.iter().find(|a| a.id == "org.gnome.Builder").unwrap();
         assert!(!builder.user_installation);
         assert_eq!(builder.size_bytes, 1_400_000_000);
+    }
+
+    #[test]
+    fn keeps_only_network_remotes() {
+        let remotes = "flathub\thttps://dl.flathub.org/repo/\nlocal-mirror\tfile:///srv/flatpak\nempty\t\n";
+        let names = parse_remote_names(remotes);
+        assert!(names.contains("flathub"));
+        assert!(!names.contains("local-mirror"));
+        assert!(!names.contains("empty"));
     }
 
     #[test]

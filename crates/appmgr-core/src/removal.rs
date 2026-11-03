@@ -414,6 +414,7 @@ Remv libpeas-1.0-0 [1.36.0-3build4]
             icon: None,
             origin,
             kind: crate::inventory::InstallKind::User,
+            hub: true,
             protected: false,
             size_bytes: 0,
             package: Some(package.to_owned()),

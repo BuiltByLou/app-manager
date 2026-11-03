@@ -30,6 +30,10 @@ pub struct App {
     pub icon: Option<String>,
     pub origin: Origin,
     pub kind: InstallKind,
+    /// A public repository updates this app (apt with a remote origin, or a
+    /// Flatpak from a network remote). False means the app came from a local
+    /// file and nothing would update it unless a source is linked.
+    pub hub: bool,
     /// Não deve ser removida: é essencial ou faz parte do desktop.
     pub protected: bool,
     pub size_bytes: u64,
@@ -53,6 +57,9 @@ pub trait SystemProbe {
     fn desktop_packages(&self) -> HashSet<String>;
     /// Pacotes donos de caminhos (`dpkg -S`), resolvidos numa só chamada.
     fn package_owners(&self, paths: &[PathBuf]) -> HashMap<PathBuf, String>;
+    /// Which of these packages were installed from a remote repository
+    /// (`apt-cache policy`), as opposed to a local `.deb` file.
+    fn packages_with_remote_origin(&self, packages: &[String]) -> HashSet<String>;
     /// Caminho absoluto de um programa, resolvendo nomes simples pelo `PATH`.
     fn which(&self, program: &str) -> Option<PathBuf>;
     fn flatpak_apps(&self) -> Vec<FlatpakApp>;
@@ -86,6 +93,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             } else {
                 InstallKind::PreInstalled
             },
+            hub: flatpak.from_remote,
             protected: false,
             size_bytes: flatpak.size_bytes,
             package: Some(flatpak.id),
@@ -109,6 +117,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             icon,
             origin: Origin::AppImage,
             kind: InstallKind::User,
+            hub: false,
             protected: false,
             size_bytes: 0,
             package: None,
@@ -132,6 +141,16 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
 
     let paths: Vec<PathBuf> = candidates.iter().map(|(_, path)| path.clone()).collect();
     let owners = probe.package_owners(&paths);
+
+    // Only the packages behind a desktop entry matter here, and one call
+    // answers for all of them.
+    let names: Vec<String> = owners
+        .values()
+        .map(|owner| crate::dpkg::base_name(owner).to_owned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let remote = probe.packages_with_remote_origin(&names);
 
     for (entry, path) in candidates {
         let Some(owner) = owners.get(&path) else {
@@ -162,6 +181,7 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             } else {
                 InstallKind::User
             },
+            hub: remote.contains(crate::dpkg::base_name(&package.name)),
             protected: is_protected(package, &desktop),
             size_bytes: package.installed_size_kib * 1024,
             package: Some(package.name.clone()),
@@ -221,6 +241,7 @@ mod tests {
         manual: HashSet<String>,
         desktop: HashSet<String>,
         owners: HashMap<String, String>,
+        remote: HashSet<String>,
         programs: HashMap<String, PathBuf>,
         flatpaks: Vec<FlatpakApp>,
         appimages: Vec<PathBuf>,
@@ -256,6 +277,14 @@ mod tests {
                     let owner = self.owners.get(path.to_str()?)?;
                     Some((path.clone(), owner.clone()))
                 })
+                .collect()
+        }
+
+        fn packages_with_remote_origin(&self, packages: &[String]) -> HashSet<String> {
+            packages
+                .iter()
+                .filter(|name| self.remote.contains(name.as_str()))
+                .cloned()
                 .collect()
         }
 
@@ -320,6 +349,12 @@ mod tests {
                 ("/usr/bin/gnome-terminal".to_owned(), "gnome-terminal".to_owned()),
                 ("/usr/bin/gnome-software".to_owned(), "gnome-software".to_owned()),
             ]),
+            remote: HashSet::from([
+                "firefox".to_owned(),
+                "gimp".to_owned(),
+                "gnome-terminal".to_owned(),
+                "gnome-software".to_owned(),
+            ]),
             flatpaks: vec![FlatpakApp {
                 id: "org.localsend.localsend_app".to_owned(),
                 name: "LocalSend".to_owned(),
@@ -328,6 +363,7 @@ mod tests {
                 user_installation: true,
                 size_bytes: 58_200_000,
                 icon: None,
+                from_remote: true,
             }],
             appimages: vec![PathBuf::from("/home/ed/Applications/tool.AppImage")],
             programs: HashMap::new(),
@@ -343,6 +379,33 @@ mod tests {
         assert_eq!(firefox.version.as_deref(), Some("1:158.0.1"));
         assert_eq!(firefox.icon.as_deref(), Some("Firefox"));
         assert_eq!(firefox.size_bytes, 1000 * 1024);
+    }
+
+    #[test]
+    fn marks_a_package_with_a_remote_origin_as_a_hub_app() {
+        let apps = build_inventory(&fake());
+        let firefox = apps.iter().find(|a| a.name == "Firefox").unwrap();
+        assert!(firefox.hub);
+    }
+
+    #[test]
+    fn a_deb_installed_from_a_file_is_not_a_hub_app() {
+        let mut system = fake();
+        system.remote.remove("gimp");
+        let apps = build_inventory(&system);
+        let gimp = apps.iter().find(|a| a.name == "GIMP").unwrap();
+        assert!(!gimp.hub, "apt installed it, but no repository provides it");
+        let firefox = apps.iter().find(|a| a.name == "Firefox").unwrap();
+        assert!(firefox.hub);
+    }
+
+    #[test]
+    fn a_sideloaded_flatpak_is_not_a_hub_app() {
+        let mut system = fake();
+        system.flatpaks[0].from_remote = false;
+        let apps = build_inventory(&system);
+        let localsend = apps.iter().find(|a| a.name == "LocalSend").unwrap();
+        assert!(!localsend.hub);
     }
 
     #[test]

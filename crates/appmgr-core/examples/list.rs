@@ -25,7 +25,8 @@ fn main() {
             Origin::AppImage => "appimage",
         };
         println!(
-            "{kind} {origin:<8} {:<40} {:<20} {}",
+            "{kind} {origin:<8} {:<5} {:<40} {:<20} {}",
+            if app.hub { "hub" } else { "local" },
             app.name,
             app.version.as_deref().unwrap_or("-"),
             app.package.as_deref().unwrap_or("-")

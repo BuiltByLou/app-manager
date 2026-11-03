@@ -273,6 +273,7 @@ mod tests {
             icon: None,
             origin,
             kind: InstallKind::User,
+            hub: true,
             protected: false,
             size_bytes: 0,
             package: Some(package.to_owned()),
