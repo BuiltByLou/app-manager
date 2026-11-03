@@ -42,7 +42,7 @@ lista.
 ## Instalar
 
 ```bash
-sudo apt install ./app-manager_0.0.8_amd64.deb
+sudo apt install ./app-manager_0.0.9_amd64.deb
 ```
 
 ## Compilar

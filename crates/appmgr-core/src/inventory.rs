@@ -163,7 +163,10 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             continue;
         }
 
-        let id = format!("apt:{}", package.name);
+        // The id uses the base name, so a package whose dpkg name carries an
+        // architecture (`libfoo:amd64`) still matches the id recorded when the
+        // installer read its name from the `.deb`.
+        let id = format!("apt:{}", crate::dpkg::base_name(&package.name));
         if !seen_ids.insert(id.clone()) {
             continue;
         }
@@ -379,6 +382,19 @@ mod tests {
         assert_eq!(firefox.version.as_deref(), Some("1:158.0.1"));
         assert_eq!(firefox.icon.as_deref(), Some("Firefox"));
         assert_eq!(firefox.size_bytes, 1000 * 1024);
+    }
+
+    #[test]
+    fn an_apt_id_drops_the_architecture_suffix() {
+        let mut system = fake();
+        system.packages[0].name = "firefox:amd64".to_owned();
+        system.owners.insert(
+            "/usr/lib/firefox/firefox".to_owned(),
+            "firefox:amd64".to_owned(),
+        );
+        let apps = build_inventory(&system);
+        let firefox = apps.iter().find(|a| a.name == "Firefox").unwrap();
+        assert_eq!(firefox.id, "apt:firefox");
     }
 
     #[test]

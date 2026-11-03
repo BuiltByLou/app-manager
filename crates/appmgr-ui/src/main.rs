@@ -637,6 +637,11 @@ impl Application for AppManager {
                 match result {
                     Ok(message) => {
                         self.maint_status = message;
+                        // The installer recorded the repository on disk. Read
+                        // it back so the new app is already tagged GitHub and
+                        // can be checked for updates without a restart.
+                        self.registry = Registry::load();
+                        self.loading = true;
                         load_inventory()
                     }
                     Err(error) => {
@@ -718,6 +723,9 @@ impl Application for AppManager {
                     );
                     self.selected = Some(done.new_id.clone());
                     self.detail = Some(done.new_id);
+                    // The worker wrote the new source to disk; pick it up so
+                    // the list does not show a freshly updated app as local.
+                    self.registry = Registry::load();
                     self.loading = true;
                     load_inventory()
                 }
