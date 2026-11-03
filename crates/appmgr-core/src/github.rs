@@ -302,6 +302,28 @@ mod tests {
         );
     }
 
+    /// A real release mixes every platform. The picker must still find the
+    /// Linux builds for this machine, or the install card ends up empty.
+    #[test]
+    fn keeps_the_linux_formats_of_a_mixed_release() {
+        let json = r#"{"tag_name":"v0.47.0","assets":[
+            {"name":"Sonora-Setup.exe","browser_download_url":"u","size":1},
+            {"name":"sonora-v0.47.0-aarch64.AppImage","browser_download_url":"u","size":1},
+            {"name":"sonora-v0.47.0-x86_64.AppImage","browser_download_url":"u","size":1},
+            {"name":"sonora-v0.47.0-aarch64.flatpak","browser_download_url":"u","size":1},
+            {"name":"sonora-v0.47.0-x86_64.flatpak","browser_download_url":"u","size":1},
+            {"name":"sonora-v0.47.0-x86_64-unknown-linux-gnu","browser_download_url":"u","size":1},
+            {"name":"sonora-v0.47.0-licenses.tar.gz","browser_download_url":"u","size":1}
+        ]}"#;
+        let release = Release::parse_json(json).unwrap();
+        let assets = installable_assets(&release);
+
+        assert!(!assets.is_empty(), "the card would have no button at all");
+        assert!(assets.iter().all(is_compatible));
+        assert!(assets.iter().all(|asset| asset.kind != AssetKind::Other));
+        assert!(assets.iter().all(|asset| !asset.name.ends_with(".exe")));
+    }
+
     #[test]
     fn asset_kind_names_round_trip() {
         for kind in [

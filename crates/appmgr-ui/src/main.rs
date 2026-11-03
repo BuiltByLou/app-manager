@@ -1371,10 +1371,7 @@ impl AppManager {
         }
 
         if let Some(release) = &self.maint_release {
-            content = content.push(text::title3(format!("Release {}", release.tag)));
-            // Build a card per compatible asset group.
-            let mut card = widget::column![].spacing(8).align_x(Alignment::Center);
-            card = card.push(widget::icon::from_name("application-x-executable").size(48));
+            content = content.push(text::title3(format!("{} {}", fl!("maint-release"), release.tag)));
             // Derive a display name from the repo URL.
             let name = self
                 .maint_url
@@ -1383,26 +1380,37 @@ impl AppManager {
                 .next()
                 .unwrap_or("App")
                 .to_owned();
-            card = card.push(text::title3(name));
-            card = card.push(text::caption(release.tag.clone()));
 
-            let mut buttons = widget::row![].spacing(8);
+            let heading = widget::row![
+                widget::icon::from_name("application-x-executable").size(48),
+                widget::column![text::title3(name), text::caption(release.tag.clone())].spacing(2),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+
+            // One button per compatible asset, stacked. A wrapping row inside
+            // a shrinking card lays out with no usable width, which is what
+            // made the install buttons disappear.
+            let mut buttons = widget::column![].spacing(6).width(Length::Fill);
             for asset in &self.maint_assets {
                 let label = match asset.kind {
-                    AssetKind::Deb => "Install .deb",
-                    AssetKind::AppImage => "Install .AppImage",
-                    AssetKind::Flatpak => "Install .flatpak",
+                    AssetKind::Deb => fl!("maint-install-deb"),
+                    AssetKind::AppImage => fl!("maint-install-appimage"),
+                    AssetKind::Flatpak => fl!("maint-install-flatpak"),
                     AssetKind::Other => continue,
                 };
                 buttons = buttons.push(
-                    button::standard(label).on_press(Message::InstallAsset(asset.kind)),
+                    button::standard(label)
+                        .width(Length::Fill)
+                        .on_press(Message::InstallAsset(asset.kind)),
                 );
             }
-            card = card.push(buttons.wrap());
-            content = content.push(
-                container(card.padding(16))
-                    .width(Length::Shrink),
-            );
+            if self.maint_assets.is_empty() {
+                buttons = buttons.push(text::body(fl!("maint-no-assets")));
+            }
+
+            let card = widget::column![heading, buttons].spacing(12);
+            content = content.push(container(card.padding(16)).width(Length::Fill));
         }
 
         container(content.padding(20).width(Length::Fill).height(Length::Fill)).into()

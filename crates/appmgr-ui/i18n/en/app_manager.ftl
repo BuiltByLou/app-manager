@@ -29,6 +29,10 @@ maint-load = Load latest release
 maint-loading = Loading…
 maint-install = Install
 maint-release = Release
+maint-install-deb = Install .deb
+maint-install-appimage = Install .AppImage
+maint-install-flatpak = Install .flatpak
+maint-no-assets = This release has no installable build for this machine.
 
 apps-count = { $count ->
     [one] { $count } app
