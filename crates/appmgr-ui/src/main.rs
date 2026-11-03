@@ -19,7 +19,7 @@ use appmgr_core::registry::{ManagedApp, Registry};
 use appmgr_core::removal::{
     RemovalPlan, authorize, is_authorized, keep_sudo_alive, plan_for, removal_command, run_removal,
 };
-use appmgr_core::updates::{UpdateCheck, UpdateStatus, evaluate};
+use appmgr_core::updates::{UpdateCheck, UpdateStatus, evaluate, is_newer};
 use appmgr_core::version;
 use prefs::Preferences;
 use std::collections::{HashMap, HashSet};
@@ -285,7 +285,10 @@ impl Application for AppManager {
                 // not in the name anymore. The source registry still knows it.
                 for app in &mut apps {
                     if let Some(managed) = self.registry.get(&app.id) {
-                        if !managed.installed_version.is_empty() {
+                        // The system is the source of truth for what is
+                        // installed. The registry only fills the gap for an
+                        // AppImage, whose stable filename carries no version.
+                        if app.version.is_none() && !managed.installed_version.is_empty() {
                             app.version = Some(managed.installed_version.clone());
                         }
                         // An app installed from GitHub is always the user's app,
@@ -326,7 +329,17 @@ impl Application for AppManager {
                     return Task::none();
                 };
                 self.selected = Some(id.clone());
-                self.detail = Some(id);
+                self.detail = Some(id.clone());
+                // A linked app is checked the first time its details open, so
+                // the pane can show the update without hunting for "Check".
+                if !self.updates.contains_key(&id)
+                    && !self.checking_updates.contains(&id)
+                    && let Some(managed) = self.registry.get(&id).cloned()
+                {
+                    self.checking_updates.insert(id.clone());
+                    self.update_note = fl!("update-checking");
+                    return check_updates(vec![(id, managed)]);
+                }
                 Task::none()
             }
             Message::Select(index) => {
@@ -1136,10 +1149,14 @@ impl AppManager {
                 icon,
                 selected: self.is_selected(&app.id),
                 menu_open: self.is_menu_open(&app.id),
-                update_available: self
-                    .updates
-                    .get(&app.id)
-                    .is_some_and(|check| check.status == UpdateStatus::Available),
+                update_latest: self.updates.get(&app.id).and_then(|check| {
+                    let newest = check
+                        .status == UpdateStatus::Available
+                        || (check.status == UpdateStatus::Unknown
+                            && check.asset.is_some()
+                            && is_newer(app.version.as_deref(), check.latest.as_deref()?));
+                    if newest { check.latest.as_deref() } else { None }
+                }),
             },
             index,
         )
@@ -1426,6 +1443,9 @@ impl AppManager {
         content = content.push(icon);
         content = content.push(text::title2(app.name.clone()));
         let mut fields = widget::column![].spacing(10);
+        // What is installed first, then what could be installed. Never the
+        // other way around: a linked repository must not make the app claim a
+        // version it does not have.
         fields = fields.push(field(fl!("detail-version"), version_label(app)));
         let managed = self.registry.get(&app.id);
         let tag = source_tag(app, managed.is_some());
@@ -1438,7 +1458,9 @@ impl AppManager {
             },
         ));
         if let Some(check) = self.updates.get(&app.id) {
-            if let Some(latest) = &check.latest {
+            if let Some(latest) = &check.latest
+                && is_newer(app.version.as_deref(), latest)
+            {
                 fields = fields.push(field(
                     fl!("detail-available"),
                     version::display(latest).to_owned(),
@@ -1460,6 +1482,19 @@ impl AppManager {
             },
         ));
         content = content.push(fields);
+
+        // The update action sits right under the version it would change, so
+        // it is never buried at the bottom of the pane.
+        if let Some(check) = self.updates.get(&app.id)
+            && check.asset.is_some()
+            && (check.status == UpdateStatus::Available
+                || (check.status == UpdateStatus::Unknown
+                    && is_newer(app.version.as_deref(), check.latest.as_deref().unwrap_or(""))))
+        {
+            content = content.push(
+                button::suggested(fl!("update-apply")).on_press(Message::ApplyUpdate(index)),
+            );
+        }
 
         // A hub app is updated by apt or Flathub, so it has nothing to link.
         // A GitHub app can be re-pointed; a local file can be linked to start
@@ -1498,13 +1533,6 @@ impl AppManager {
         }
 
         if let Some(check) = self.updates.get(&app.id) {
-            if check.asset.is_some()
-                && matches!(check.status, UpdateStatus::Available | UpdateStatus::Unknown)
-            {
-                content = content.push(
-                    button::suggested(fl!("update-apply")).on_press(Message::ApplyUpdate(index)),
-                );
-            }
             if let (Some(latest), Some(managed)) = (&check.latest, managed)
                 && let Ok(repo) = Repo::parse(&managed.repo)
             {
@@ -1757,7 +1785,8 @@ struct RowView<'a> {
     icon: widget::icon::Handle,
     selected: bool,
     menu_open: bool,
-    update_available: bool,
+    /// The version waiting upstream, when there is one.
+    update_latest: Option<&'a str>,
 }
 
 fn app_row<'a>(
@@ -1772,7 +1801,7 @@ fn app_row<'a>(
         icon,
         selected,
         menu_open,
-        update_available,
+        update_latest,
     } = view;
     let icon = widget::icon::icon(icon).size(32);
 
@@ -1792,11 +1821,15 @@ fn app_row<'a>(
     if app.protected {
         row = row.push(widget::icon::from_name("changes-prevent-symbolic").size(16));
     }
-    if update_available {
+    if let Some(latest) = update_latest {
         row = row.push(
-            container(text::caption(fl!("update-badge")))
-                .padding([2, 8])
-                .class(cosmic::theme::Container::Card),
+            container(text::caption(format!(
+                "{} · {}",
+                fl!("update-badge"),
+                version::display(latest)
+            )))
+            .padding([2, 8])
+            .class(cosmic::theme::Container::Card),
         );
     }
 
