@@ -121,20 +121,21 @@ release-notes = Release notes
 update-check = Check
 update-check-all = Check all updates
 update-checking = Checking for updates…
-update-summary = { $count ->
-    [one] { $count } update available
-   *[other] { $count } updates available
+update-available-note = { $count ->
+    [one] 1 update available: { $names }
+   *[other] { $count } updates available: { $names }
 }
 update-all-current = All linked apps are up to date.
-update-check-failed = { $count ->
-    [one] { $count } check failed
-   *[other] { $count } checks failed
+update-failed-note = Could not check { $name }: { $error }
+update-failed-many = { $count ->
+    [one] 1 check failed: { $names }
+   *[other] { $count } checks failed: { $names }
 }
 update-check-failed-short = Check failed
 update-unknown = Unknown
-update-unknown-summary = { $count ->
-    [one] { $count } version could not be compared
-   *[other] { $count } versions could not be compared
+update-unknown-note = { $count ->
+    [one] 1 version could not be compared: { $names }
+   *[other] { $count } versions could not be compared: { $names }
 }
 update-up-to-date = Up to date
 update-available = Update available

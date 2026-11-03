@@ -102,7 +102,7 @@ pub enum Message {
     Search(String),
     /// Rows carry their index so the view never clones an id to build a message.
     OpenDetails(usize),
-    Select(usize),
+
     CloseDetail,
     ToggleProtected,
     OpenMenu(usize),
@@ -340,13 +340,6 @@ impl Application for AppManager {
                     self.update_note = fl!("update-checking");
                     return check_updates(vec![(id, managed)]);
                 }
-                Task::none()
-            }
-            Message::Select(index) => {
-                let Some(id) = self.apps.get(index).map(|app| app.id.clone()) else {
-                    return Task::none();
-                };
-                self.selected = Some(id);
                 Task::none()
             }
             Message::CloseDetail => {
@@ -945,30 +938,76 @@ impl AppManager {
             .collect()
     }
 
+    /// The line above the search bar. It always names the app it is about: a
+    /// bare "1 check failed" leaves the user guessing which one broke.
     fn update_summary(&self) -> String {
-        let available = self
-            .updates
-            .values()
-            .filter(|check| check.status == UpdateStatus::Available)
-            .count();
-        let failed = self
-            .updates
-            .values()
-            .filter(|check| check.status == UpdateStatus::Failed)
-            .count();
-        let unknown = self
-            .updates
-            .values()
-            .filter(|check| check.status == UpdateStatus::Unknown)
-            .count();
-        if available > 0 {
-            fl!("update-summary", count = (available as i64))
-        } else if failed > 0 {
-            fl!("update-check-failed", count = (failed as i64))
-        } else if unknown > 0 {
-            fl!("update-unknown-summary", count = (unknown as i64))
-        } else {
+        let mut available = Vec::new();
+        let mut unknown = Vec::new();
+        let mut failed = Vec::new();
+
+        for (id, check) in &self.updates {
+            let name = self
+                .apps
+                .iter()
+                .find(|app| &app.id == id)
+                .map(|app| app.name.clone())
+                .unwrap_or_else(|| id.clone());
+            match check.status {
+                UpdateStatus::Available => available.push(name),
+                UpdateStatus::Unknown => unknown.push(name),
+                UpdateStatus::Failed => {
+                    failed.push((name, check.error.clone().unwrap_or_default()));
+                }
+                UpdateStatus::UpToDate => {}
+            }
+        }
+        available.sort();
+        unknown.sort();
+        failed.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut parts = Vec::new();
+        if !available.is_empty() {
+            parts.push(fl!(
+                "update-available-note",
+                count = (available.len() as i64),
+                names = available.join(", ")
+            ));
+        }
+        if !unknown.is_empty() {
+            parts.push(fl!(
+                "update-unknown-note",
+                count = (unknown.len() as i64),
+                names = unknown.join(", ")
+            ));
+        }
+        match failed.len() {
+            0 => {}
+            1 => {
+                let (name, error) = &failed[0];
+                parts.push(fl!(
+                    "update-failed-note",
+                    name = name.clone(),
+                    error = shorten(error, 140)
+                ));
+            }
+            count => {
+                let names = failed
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(fl!(
+                    "update-failed-many",
+                    count = (count as i64),
+                    names = names
+                ));
+            }
+        }
+
+        if parts.is_empty() {
             fl!("update-all-current")
+        } else {
+            parts.join(" · ")
         }
     }
 
@@ -1150,12 +1189,8 @@ impl AppManager {
                 selected: self.is_selected(&app.id),
                 menu_open: self.is_menu_open(&app.id),
                 update_latest: self.updates.get(&app.id).and_then(|check| {
-                    let newest = check
-                        .status == UpdateStatus::Available
-                        || (check.status == UpdateStatus::Unknown
-                            && check.asset.is_some()
-                            && is_newer(app.version.as_deref(), check.latest.as_deref()?));
-                    if newest { check.latest.as_deref() } else { None }
+                    let latest = check.latest.as_deref()?;
+                    is_newer(app.version.as_deref(), latest).then_some(latest)
                 }),
             },
             index,
@@ -1458,9 +1493,9 @@ impl AppManager {
             },
         ));
         if let Some(check) = self.updates.get(&app.id) {
-            if let Some(latest) = &check.latest
-                && is_newer(app.version.as_deref(), latest)
-            {
+            // Installed and available are both shown, so the comparison is
+            // visible even when they are equal.
+            if let Some(latest) = &check.latest {
                 fields = fields.push(field(
                     fl!("detail-available"),
                     version::display(latest).to_owned(),
@@ -1487,9 +1522,7 @@ impl AppManager {
         // it is never buried at the bottom of the pane.
         if let Some(check) = self.updates.get(&app.id)
             && check.asset.is_some()
-            && (check.status == UpdateStatus::Available
-                || (check.status == UpdateStatus::Unknown
-                    && is_newer(app.version.as_deref(), check.latest.as_deref().unwrap_or(""))))
+            && is_newer(app.version.as_deref(), check.latest.as_deref().unwrap_or(""))
         {
             content = content.push(
                 button::suggested(fl!("update-apply")).on_press(Message::ApplyUpdate(index)),
@@ -1870,8 +1903,10 @@ fn app_row<'a>(
         .class(style)
         .into();
 
+    // Clicking the row opens its details. The three-dot menu sits inside this
+    // area and handles its own clicks first, so removal stays deliberate.
     widget::mouse_area(row)
-        .on_press(Message::Select(index))
+        .on_press(Message::OpenDetails(index))
         .into()
 }
 
@@ -1923,6 +1958,18 @@ fn origin_label(origin: Origin) -> String {
         Origin::Flatpak => fl!("origin-flatpak"),
         Origin::AppImage => fl!("origin-appimage"),
     }
+}
+
+/// Collapses an error into one short line, so the note above the list stays a
+/// note instead of a stack of curl output.
+fn shorten(text: &str, max: usize) -> String {
+    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= max {
+        return single;
+    }
+    let mut cut: String = single.chars().take(max).collect();
+    cut.push('…');
+    cut
 }
 
 fn version_label(app: &InstalledApp) -> String {

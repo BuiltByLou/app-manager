@@ -36,16 +36,15 @@ impl UpdateCheck {
     }
 }
 
-/// Whether `latest` is newer than what is installed, or the two cannot be
-/// compared — in which case an update is still worth offering. A version the
-/// user already has (or is ahead of) never counts.
+/// Whether the installed version is strictly older than `latest`. Only then is
+/// there something to update: an equal, newer or unreadable installed version
+/// never offers one, because nothing can be compared.
 pub fn is_newer(installed: Option<&str>, latest: &str) -> bool {
     match installed {
-        Some(installed) if !installed.is_empty() => !matches!(
-            version::compare(installed, latest),
-            Some(Ordering::Equal | Ordering::Greater)
-        ),
-        _ => true,
+        Some(installed) if !installed.is_empty() => {
+            version::compare(installed, latest) == Some(Ordering::Less)
+        }
+        _ => false,
     }
 }
 
@@ -214,8 +213,8 @@ mod tests {
         assert!(is_newer(Some("0.0.1"), "v0.0.6"));
         assert!(!is_newer(Some("0.0.6"), "v0.0.6"));
         assert!(!is_newer(Some("0.0.7"), "v0.0.6"));
-        assert!(is_newer(None, "v0.0.6"), "unknown still offers a manual update");
-        assert!(is_newer(Some(""), "v0.0.6"));
+        assert!(!is_newer(None, "v0.0.6"), "nothing to compare, nothing to offer");
+        assert!(!is_newer(Some(""), "v0.0.6"));
     }
 
     #[test]
