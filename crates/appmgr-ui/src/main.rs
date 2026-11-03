@@ -1602,9 +1602,14 @@ fn load_inventory() -> Task<Message> {
 fn check_auth() -> Task<Message> {
     Task::perform(
         async {
+            // A debug build can authorize from a developer's own environment,
+            // so no password is ever written into the source.
             #[cfg(debug_assertions)]
             {
-                if authorize("not-a-password").is_ok() {
+                if let Ok(password) = std::env::var("APPMGR_DEBUG_PASSWORD")
+                    && !password.is_empty()
+                    && authorize(&password).is_ok()
+                {
                     return true;
                 }
             }
