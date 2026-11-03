@@ -1,16 +1,26 @@
-use appmgr_core::inventory::{App, InstallKind};
+use appmgr_core::inventory::{App, InstallKind, Origin};
 
-/// A set of apps with its own heading inside a page. Rows are indices into the
-/// inventory, so the view borrows instead of cloning the apps on every redraw.
-pub struct Group {
-    pub kind: GroupKind,
-    pub rows: Vec<usize>,
+/// Where an app came from, as the second tag on a row. GitHub wins over the
+/// package format, because that is what makes the app updatable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceTag {
+    Deb,
+    Flatpak,
+    AppImage,
+    GitHub,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupKind {
-    Protected,
-    Removable,
+/// Which source tag an app carries. `managed` says whether the app has a
+/// GitHub source recorded, which the inventory alone cannot know.
+pub fn source_tag(app: &App, managed: bool) -> SourceTag {
+    if managed {
+        return SourceTag::GitHub;
+    }
+    match app.origin {
+        Origin::Apt => SourceTag::Deb,
+        Origin::Flatpak => SourceTag::Flatpak,
+        Origin::AppImage => SourceTag::AppImage,
+    }
 }
 
 /// Whether `app` matches an already-normalised (trimmed, lowercase) query.
@@ -25,57 +35,35 @@ pub fn matches(app: &App, query: &str) -> bool {
             .is_some_and(|package| package.to_lowercase().contains(query))
 }
 
-fn normalise(query: &str) -> String {
-    query.trim().to_lowercase()
-}
-
-/// Indices of the apps of `kind` that match `query`, sorted by name.
-pub fn matching(apps: &[App], kind: InstallKind, query: &str) -> Vec<usize> {
-    let query = normalise(query);
+/// The rows the list shows: search plus the two tag filters, sorted by name.
+/// `managed` reports whether an app has a GitHub source recorded; it is only
+/// called when a source filter is active.
+pub fn visible_rows(
+    apps: &[App],
+    query: &str,
+    kind: Option<InstallKind>,
+    source: Option<SourceTag>,
+    managed: impl Fn(&App) -> bool,
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
     let mut rows: Vec<usize> = apps
         .iter()
         .enumerate()
-        .filter(|(_, app)| app.kind == kind && matches(app, &query))
+        .filter(|(_, app)| {
+            if kind.is_some_and(|kind| app.kind != kind) {
+                return false;
+            }
+            if let Some(wanted) = source
+                && source_tag(app, managed(app)) != wanted
+            {
+                return false;
+            }
+            matches(app, &query)
+        })
         .map(|(index, _)| index)
         .collect();
     rows.sort_by_cached_key(|&index| apps[index].name.to_lowercase());
     rows
-}
-
-/// The system apps, split between removable and protected. Removable ones come
-/// first; protected ones are locked, so they sit at the bottom and can be
-/// hidden. `show_protected` keeps them out of the list entirely when false.
-pub fn system_groups(apps: &[App], query: &str, show_protected: bool) -> Vec<Group> {
-    let (protected, removable): (Vec<usize>, Vec<usize>) = apps
-        .iter()
-        .enumerate()
-        .filter(|(_, app)| app.kind != InstallKind::User && matches(app, query))
-        .map(|(index, _)| index)
-        .partition(|&index| apps[index].protected);
-
-    let mut groups = Vec::new();
-    if !removable.is_empty() {
-        groups.push(Group {
-            kind: GroupKind::Removable,
-            rows: removable,
-        });
-    }
-    if show_protected && !protected.is_empty() {
-        groups.push(Group {
-            kind: GroupKind::Protected,
-            rows: protected,
-        });
-    }
-    groups
-}
-
-/// How many locked system apps match the current search, shown or not.
-pub fn protected_count(apps: &[App], query: &str) -> usize {
-    apps
-        .iter()
-        .enumerate()
-        .filter(|(_, app)| app.kind != InstallKind::User && app.protected && matches(app, query))
-        .count()
 }
 
 /// Human-readable size: "512 B", "12 kB", "58.2 MB", "1.4 GB".
@@ -91,21 +79,20 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use appmgr_core::inventory::Origin;
 
-    fn app(name: &str, kind: InstallKind) -> App {
-        app_with(name, kind, false)
-    }
-
-    fn app_with(name: &str, kind: InstallKind, protected: bool) -> App {
+    fn app(name: &str, kind: InstallKind, origin: Origin) -> App {
         App {
-            id: format!("apt:{name}"),
+            id: format!("{}:{name}", match origin {
+                Origin::Apt => "apt",
+                Origin::Flatpak => "flatpak",
+                Origin::AppImage => "appimage",
+            }),
             name: name.to_owned(),
             version: Some("1.0".to_owned()),
             icon: None,
-            origin: Origin::Apt,
+            origin,
             kind,
-            protected,
+            protected: false,
             size_bytes: 0,
             package: Some(name.to_owned()),
         }
@@ -113,10 +100,11 @@ mod tests {
 
     fn sample() -> Vec<App> {
         vec![
-            app("zsh", InstallKind::User),
-            app_with("Firefox", InstallKind::System, false),
-            app("brave", InstallKind::User),
-            app_with("COSMIC Store", InstallKind::System, true),
+            app("zsh", InstallKind::User, Origin::Apt),
+            app("Firefox", InstallKind::PreInstalled, Origin::Apt),
+            app("brave", InstallKind::User, Origin::Flatpak),
+            app("Tool", InstallKind::User, Origin::AppImage),
+            app("Driver", InstallKind::System, Origin::Apt),
         ]
     }
 
@@ -124,93 +112,75 @@ mod tests {
         rows.iter().map(|&index| apps[index].name.as_str()).collect()
     }
 
+    fn none_managed(_: &App) -> bool {
+        false
+    }
+
     #[test]
     fn filters_by_name_ignoring_case() {
         let apps = sample();
-        let found = matching(&apps, InstallKind::System, "FIREF");
+        let found = visible_rows(&apps, "FIREF", None, None, none_managed);
         assert_eq!(names(&apps, &found), vec!["Firefox"]);
     }
 
     #[test]
     fn filters_by_package_name() {
         let apps = sample();
-        assert_eq!(names(&apps, &matching(&apps, InstallKind::System, "cosmic")), vec!["COSMIC Store"]);
-    }
-
-    #[test]
-    fn empty_query_keeps_everything_of_that_kind() {
-        let apps = sample();
-        assert_eq!(matching(&apps, InstallKind::User, "  ").len(), 2);
-    }
-
-    #[test]
-    fn shows_only_the_requested_group() {
-        let apps = sample();
-        let user = matching(&apps, InstallKind::User, "");
-        assert_eq!(user.len(), 2);
-        assert!(user.iter().all(|&index| apps[index].kind == InstallKind::User));
+        let found = visible_rows(&apps, "driver", None, None, none_managed);
+        assert_eq!(names(&apps, &found), vec!["Driver"]);
     }
 
     #[test]
     fn sorts_alphabetically_ignoring_case() {
         let apps = sample();
-        let ordered = matching(&apps, InstallKind::System, "");
-        assert_eq!(names(&apps, &ordered), vec!["COSMIC Store", "Firefox"]);
+        let rows = visible_rows(&apps, "", None, None, none_managed);
+        assert_eq!(
+            names(&apps, &rows),
+            vec!["brave", "Driver", "Firefox", "Tool", "zsh"]
+        );
     }
 
     #[test]
-    fn combines_search_and_group() {
+    fn filters_by_classification() {
         let apps = sample();
-        assert_eq!(names(&apps, &matching(&apps, InstallKind::User, "bra")), vec!["brave"]);
+        let rows = visible_rows(&apps, "", Some(InstallKind::User), None, none_managed);
+        assert_eq!(names(&apps, &rows), vec!["brave", "Tool", "zsh"]);
+    }
+
+    #[test]
+    fn filters_by_source() {
+        let apps = sample();
+        let rows = visible_rows(&apps, "", None, Some(SourceTag::Flatpak), none_managed);
+        assert_eq!(names(&apps, &rows), vec!["brave"]);
+    }
+
+    #[test]
+    fn github_wins_over_the_package_format() {
+        let apps = sample();
+        let managed = |app: &App| app.name == "zsh";
+        let rows = visible_rows(&apps, "", None, Some(SourceTag::GitHub), managed);
+        assert_eq!(names(&apps, &rows), vec!["zsh"]);
+        let rows = visible_rows(&apps, "", None, Some(SourceTag::Deb), managed);
+        assert_eq!(names(&apps, &rows), vec!["Driver", "Firefox"]);
+    }
+
+    #[test]
+    fn combines_search_and_both_filters() {
+        let apps = sample();
+        let rows = visible_rows(
+            &apps,
+            "o",
+            Some(InstallKind::User),
+            Some(SourceTag::AppImage),
+            none_managed,
+        );
+        assert_eq!(names(&apps, &rows), vec!["Tool"]);
     }
 
     #[test]
     fn no_match_means_empty() {
-        assert!(matching(&sample(), InstallKind::User, "firefox").is_empty());
-    }
-
-    #[test]
-    fn separates_protected_system_apps_from_the_rest() {
         let apps = sample();
-        let groups = system_groups(&apps, "", true);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].kind, GroupKind::Removable);
-        assert_eq!(names(&apps, &groups[0].rows), vec!["Firefox"]);
-        assert_eq!(groups[1].kind, GroupKind::Protected);
-        assert_eq!(names(&apps, &groups[1].rows), vec!["COSMIC Store"]);
-    }
-
-    #[test]
-    fn hides_a_system_group_when_it_is_empty() {
-        let apps = vec![app_with("COSMIC Store", InstallKind::System, true)];
-        let groups = system_groups(&apps, "", true);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, GroupKind::Protected);
-    }
-
-    #[test]
-    fn hides_protected_apps_when_asked_to() {
-        let apps = sample();
-        let groups = system_groups(&apps, "", false);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, GroupKind::Removable);
-        assert_eq!(names(&apps, &groups[0].rows), vec!["Firefox"]);
-    }
-
-    #[test]
-    fn search_applies_to_both_system_groups() {
-        let apps = sample();
-        let groups = system_groups(&apps, "firefox", true);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, GroupKind::Removable);
-    }
-
-    #[test]
-    fn counts_protected_matches_even_when_hidden() {
-        let apps = sample();
-        assert_eq!(protected_count(&apps, ""), 1);
-        assert_eq!(protected_count(&apps, "cosmic"), 1);
-        assert_eq!(protected_count(&apps, "firefox"), 0);
+        assert!(visible_rows(&apps, "firefox", Some(InstallKind::User), None, none_managed).is_empty());
     }
 
     #[test]

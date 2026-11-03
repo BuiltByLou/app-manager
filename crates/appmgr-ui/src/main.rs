@@ -4,7 +4,7 @@ mod view_model;
 
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::{Alignment, Length, Size};
-use cosmic::widget::{self, button, container, nav_bar, scrollable, text};
+use cosmic::widget::{self, button, container, scrollable, text};
 use cosmic::{Application, Element};
 
 use appmgr_core::inventory::{App as InstalledApp, InstallKind, Origin, build_inventory};
@@ -23,7 +23,7 @@ use appmgr_core::updates::{UpdateCheck, UpdateStatus, evaluate};
 use appmgr_core::version;
 use prefs::Preferences;
 use std::collections::{HashMap, HashSet};
-use view_model::{Group, GroupKind, format_size, matching, protected_count, system_groups};
+use view_model::{SourceTag, format_size, source_tag, visible_rows};
 
 const APP_ID: &str = "io.github.builtbylou.app_manager";
 
@@ -32,30 +32,20 @@ fn main() -> cosmic::iced::Result {
     cosmic::app::run::<AppManager>(settings, ())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
-    User,
-    System,
-    Maintainer,
+fn source_tag_label(tag: SourceTag) -> String {
+    match tag {
+        SourceTag::Deb => fl!("tag-deb"),
+        SourceTag::Flatpak => fl!("tag-flatpak"),
+        SourceTag::AppImage => fl!("tag-appimage"),
+        SourceTag::GitHub => fl!("tag-github"),
+    }
 }
 
-impl Page {
-    const ALL: [Page; 3] = [Page::User, Page::System, Page::Maintainer];
-
-    fn title(self) -> String {
-        match self {
-            Page::User => fl!("nav-user"),
-            Page::System => fl!("nav-system"),
-            Page::Maintainer => fl!("nav-maintainer"),
-        }
-    }
-
-    fn icon(self) -> &'static str {
-        match self {
-            Page::User => "system-users-symbolic",
-            Page::System => "computer-symbolic",
-            Page::Maintainer => "software-update-available-symbolic",
-        }
+fn kind_label(kind: InstallKind) -> String {
+    match kind {
+        InstallKind::User => fl!("tag-user"),
+        InstallKind::PreInstalled => fl!("tag-preinstalled"),
+        InstallKind::System => fl!("tag-system"),
     }
 }
 
@@ -160,6 +150,9 @@ pub enum Message {
     SourceUrl(String),
     SaveSource,
     OpenUrl(String),
+    SetKindFilter(Option<InstallKind>),
+    SetSourceFilter(Option<SourceTag>),
+    ToggleMaintainer,
 }
 
 /// What a finished update leaves behind for the UI.
@@ -173,18 +166,22 @@ pub struct UpdateDone {
 
 pub struct AppManager {
     core: Core,
-    nav_model: nav_bar::Model,
     apps: Vec<InstalledApp>,
     /// Subtitle and icon per app, resolved once when the inventory loads.
     /// Rebuilding them on every redraw is what made long lists feel heavy.
     subtitles: Vec<String>,
     icons: Vec<widget::icon::Handle>,
-    /// Rows shown on each page, recomputed only when the inventory or the
-    /// search changes. Rows are indices into `apps`.
-    user_rows: Vec<usize>,
-    system_groups: Vec<Group>,
-    protected_total: usize,
+    /// (classification, source) tag labels per app, resolved with the icons.
+    tags: Vec<(String, String)>,
+    /// The unified list, recomputed only when the inventory, the search or a
+    /// filter changes. Rows are indices into `apps`.
+    all_rows: Vec<usize>,
     query: String,
+    /// Active tag filters. `None` means "every value of that tag".
+    kind_filter: Option<InstallKind>,
+    source_filter: Option<SourceTag>,
+    /// Whether the "install from GitHub" view is open.
+    show_maintainer: bool,
     loading: bool,
     /// Id of the app whose row is highlighted.
     selected: Option<String>,
@@ -237,27 +234,18 @@ impl Application for AppManager {
     }
 
     fn init(core: Core, _flags: ()) -> (Self, Task<Message>) {
-        let mut nav_model = nav_bar::Model::default();
-        for page in Page::ALL {
-            nav_model
-                .insert()
-                .text(page.title())
-                .icon(widget::icon::from_name(page.icon()))
-                .data(page);
-        }
-        nav_model.activate_position(0);
-
         (
             Self {
                 core,
-                nav_model,
                 apps: Vec::new(),
                 subtitles: Vec::new(),
                 icons: Vec::new(),
-                user_rows: Vec::new(),
-                system_groups: Vec::new(),
-                protected_total: 0,
+                tags: Vec::new(),
+                all_rows: Vec::new(),
                 query: String::new(),
+                kind_filter: None,
+                source_filter: None,
+                show_maintainer: false,
                 loading: true,
                 selected: None,
                 detail: None,
@@ -282,18 +270,6 @@ impl Application for AppManager {
             },
             Task::batch([load_inventory(), check_auth()]),
         )
-    }
-
-    fn nav_model(&self) -> Option<&nav_bar::Model> {
-        Some(&self.nav_model)
-    }
-
-    fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
-        self.nav_model.activate(id);
-        self.selected = None;
-        self.detail = None;
-        self.menu = None;
-        Task::none()
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -810,6 +786,9 @@ impl Application for AppManager {
                     return Task::none();
                 }
                 self.update_note = fl!("source-saved");
+                // The row tag may just have changed from Deb/Flatpak to GitHub.
+                self.rebuild_app_text();
+                self.rebuild_rows();
                 self.checking_updates.insert(app.id.clone());
                 check_updates(vec![(app.id.clone(), managed)])
             }
@@ -817,11 +796,29 @@ impl Application for AppManager {
                 let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 Task::none()
             }
+            Message::SetKindFilter(kind) => {
+                self.kind_filter = kind;
+                self.rebuild_rows();
+                self.prune_selection();
+                Task::none()
+            }
+            Message::SetSourceFilter(origin) => {
+                self.source_filter = origin;
+                self.rebuild_rows();
+                self.prune_selection();
+                Task::none()
+            }
+            Message::ToggleMaintainer => {
+                self.show_maintainer = !self.show_maintainer;
+                self.selected = None;
+                self.detail = None;
+                self.menu = None;
+                Task::none()
+            }
         }
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let page = self.page();
         let check_label = if self.checking_all {
             fl!("update-checking")
         } else {
@@ -832,9 +829,15 @@ impl Application for AppManager {
         } else {
             button::standard(check_label).on_press(Message::CheckUpdates)
         };
+        let install_label = if self.show_maintainer {
+            fl!("nav-apps")
+        } else {
+            fl!("nav-maintainer")
+        };
         let header = widget::row![
-            text::title3(page.title()),
+            text::title3(fl!("app-title")),
             widget::Space::new().width(Length::Fill),
+            button::standard(install_label).on_press(Message::ToggleMaintainer),
             check,
         ]
         .spacing(12)
@@ -845,11 +848,12 @@ impl Application for AppManager {
             content = content.push(text::caption(self.update_note.clone()));
         }
 
-        if matches!(page, Page::User | Page::System) {
+        if !self.show_maintainer {
             content = content.push(self.search_row());
+            content = content.push(self.filter_row());
         }
 
-        let body = self.body(page);
+        let body = self.body();
         if let Some((index, app)) = self.detail_app() {
             content = content.push(
                 widget::row![body, self.detail(index, app)]
@@ -869,13 +873,6 @@ impl Application for AppManager {
 }
 
 impl AppManager {
-    fn page(&self) -> Page {
-        self.nav_model
-            .active_data::<Page>()
-            .copied()
-            .unwrap_or(Page::User)
-    }
-
     fn selected_app(&self) -> Option<&InstalledApp> {
         let id = self.selected.as_deref()?;
         self.apps.iter().find(|app| app.id == id)
@@ -896,18 +893,33 @@ impl AppManager {
         self.apps.get(index).filter(|app| !app.protected).cloned()
     }
 
-    /// Recomputes what each page shows. Only called when the inventory, the
-    /// search or the protected toggle changes — never from `view`.
+    /// Recomputes the unified list. Only called when the inventory, the search
+    /// or a filter changes — never from `view`.
     fn rebuild_rows(&mut self) {
-        self.user_rows = matching(&self.apps, InstallKind::User, &self.query);
-        self.system_groups = system_groups(&self.apps, &self.query, self.show_protected);
-        self.protected_total = protected_count(&self.apps, &self.query);
+        let registry = &self.registry;
+        self.all_rows = visible_rows(
+            &self.apps,
+            &self.query,
+            self.kind_filter,
+            self.source_filter,
+            |app| registry.get(&app.id).is_some(),
+        );
     }
 
     /// Row text and icons, resolved once per inventory load.
     fn rebuild_app_text(&mut self) {
         self.subtitles = self.apps.iter().map(subtitle).collect();
         self.icons = self.apps.iter().map(app_icon).collect();
+        self.tags = self
+            .apps
+            .iter()
+            .map(|app| {
+                (
+                    kind_label(app.kind),
+                    source_tag_label(source_tag(app, self.registry.get(&app.id).is_some())),
+                )
+            })
+            .collect();
     }
 
     /// Registered sources that still match an app in the inventory.
@@ -952,16 +964,26 @@ impl AppManager {
         self.checking_updates.contains(id)
     }
 
-    /// Whether an app is currently listed on the page it belongs to.
+    /// Drops a selection or details panel that a filter just hid.
+    fn prune_selection(&mut self) {
+        if let Some(selected) = self.selected.clone()
+            && !self.is_visible(&selected)
+        {
+            self.selected = None;
+        }
+        if let Some(detail) = self.detail.clone()
+            && !self.is_visible(&detail)
+        {
+            self.detail = None;
+        }
+    }
+
+    /// Whether an app is currently listed after search and filters.
     fn is_visible(&self, id: &str) -> bool {
         let Some(index) = self.apps.iter().position(|app| app.id == id) else {
             return false;
         };
-        self.user_rows.contains(&index)
-            || self
-                .system_groups
-                .iter()
-                .any(|group| group.rows.contains(&index))
+        self.all_rows.contains(&index)
     }
 
     fn set_confirm_removals(&mut self, confirm: bool) {
@@ -1033,15 +1055,65 @@ impl AppManager {
             .into()
     }
 
-    fn body(&self, page: Page) -> Element<'_, Message> {
+    fn body(&self) -> Element<'_, Message> {
         if self.loading && self.apps.is_empty() {
             return centred(fl!("loading-apps"));
         }
+        if self.show_maintainer {
+            return self.maintainer_page();
+        }
+        self.list_page()
+    }
 
-        match page {
-            Page::Maintainer => self.maintainer_page(),
-            Page::User => self.list_page(&self.user_rows),
-            Page::System => self.system_page(&self.system_groups),
+    /// Tag filters, one row per tag family. Picking the active chip clears it.
+    fn filter_row(&self) -> Element<'_, Message> {
+        let mut kinds = widget::row![].spacing(6);
+        kinds = kinds.push(self.kind_chip(None, fl!("tag-all")));
+        for (kind, label) in [
+            (InstallKind::User, fl!("tag-user")),
+            (InstallKind::PreInstalled, fl!("tag-preinstalled")),
+            (InstallKind::System, fl!("tag-system")),
+        ] {
+            kinds = kinds.push(self.kind_chip(Some(kind), label));
+        }
+
+        let mut sources = widget::row![].spacing(6);
+        sources = sources.push(self.source_chip(None, fl!("tag-any-source")));
+        for (tag, label) in [
+            (SourceTag::Deb, fl!("tag-deb")),
+            (SourceTag::Flatpak, fl!("tag-flatpak")),
+            (SourceTag::AppImage, fl!("tag-appimage")),
+            (SourceTag::GitHub, fl!("tag-github")),
+        ] {
+            sources = sources.push(self.source_chip(Some(tag), label));
+        }
+
+        widget::column![kinds.wrap(), sources.wrap()]
+            .spacing(6)
+            .into()
+    }
+
+    fn kind_chip(&self, kind: Option<InstallKind>, label: String) -> Element<'_, Message> {
+        let active = self.kind_filter == kind;
+        let next = if active { None } else { kind };
+        if active {
+            button::suggested(label)
+                .on_press(Message::SetKindFilter(next))
+                .into()
+        } else {
+            button::text(label)
+                .on_press(Message::SetKindFilter(next))
+                .into()
+        }
+    }
+
+    fn source_chip(&self, tag: Option<SourceTag>, label: String) -> Element<'_, Message> {
+        let active = self.source_filter == tag;
+        let next = if active { None } else { tag };
+        if active {
+            button::suggested(label).on_press(Message::SetSourceFilter(next)).into()
+        } else {
+            button::text(label).on_press(Message::SetSourceFilter(next)).into()
         }
     }
 
@@ -1056,72 +1128,63 @@ impl AppManager {
             .get(index)
             .cloned()
             .unwrap_or_else(|| widget::icon::from_name("application-x-executable").handle());
+        let tags = self.tags.get(index);
         app_row(
             app,
-            subtitle,
-            icon,
+            RowView {
+                subtitle,
+                kind_tag: tags.map(|(kind, _)| kind.as_str()).unwrap_or(""),
+                source_tag: tags.map(|(_, source)| source.as_str()).unwrap_or(""),
+                icon,
+                selected: self.is_selected(&app.id),
+                menu_open: self.is_menu_open(&app.id),
+                update_available: self
+                    .updates
+                    .get(&app.id)
+                    .is_some_and(|check| check.status == UpdateStatus::Available),
+            },
             index,
-            self.is_selected(&app.id),
-            self.is_menu_open(&app.id),
-            self.updates
-                .get(&app.id)
-                .is_some_and(|check| check.status == UpdateStatus::Available),
         )
     }
 
-    fn list_page(&self, rows: &[usize]) -> Element<'_, Message> {
-        if rows.is_empty() {
-            return centred(self.empty_message());
+    /// One list for every app. Locked (protected) apps stay at the bottom,
+    /// behind a toggle, so they never get in the way of a quick removal.
+    fn list_page(&self) -> Element<'_, Message> {
+        let (removable, protected): (Vec<usize>, Vec<usize>) = self
+            .all_rows
+            .iter()
+            .copied()
+            .partition(|&index| !self.apps[index].protected);
+
+        let mut list = widget::column![].spacing(4);
+        list = list.push(text::caption(fl!(
+            "apps-count",
+            count = (self.all_rows.len() as i64)
+        )));
+
+        if self.all_rows.is_empty() {
+            list = list.push(text::body(self.empty_message()));
         }
 
-        let count = rows.len() as i64;
-        let mut list = widget::column![].spacing(4);
-        list = list.push(text::caption(fl!("apps-count", count = count)));
-        for &index in rows {
+        for &index in &removable {
             list = list.push(self.row(index));
         }
 
-        scrollable(list).height(Length::Fill).into()
-    }
-
-    fn system_page(&self, groups: &[Group]) -> Element<'_, Message> {
-        let mut list = widget::column![].spacing(4);
-        let protected = self.protected_total;
-
-        if protected > 0 {
-            let count = protected as i64;
+        if !protected.is_empty() {
+            let count = protected.len() as i64;
             let label = if self.show_protected {
                 fl!("hide-protected", count = count)
             } else {
                 fl!("show-protected", count = count)
             };
             list = list.push(
-                widget::row![
-                    button::text(label).on_press(Message::ToggleProtected),
-                    widget::Space::new().width(Length::Fill),
-                ]
-                .padding([0, 0, 8, 0]),
+                widget::row![button::text(label).on_press(Message::ToggleProtected)]
+                    .padding([8, 0, 8, 0]),
             );
-        }
-
-        if groups.is_empty() {
-            if !self.query.trim().is_empty() {
-                list = list.push(text::body(fl!("no-results")));
-            } else if self.show_protected || protected == 0 {
-                list = list.push(text::body(fl!("no-apps")));
-            }
-        }
-
-        for group in groups {
-            let count = group.rows.len() as i64;
-            list = list.push(text::title3(group_title(group.kind)));
-            list = list.push(text::caption(format!(
-                "{} · {}",
-                group_caption(group.kind),
-                fl!("apps-count", count = count)
-            )));
-            for &index in &group.rows {
-                list = list.push(self.row(index));
+            if self.show_protected {
+                for &index in &protected {
+                    list = list.push(self.row(index));
+                }
             }
         }
 
@@ -1625,18 +1688,38 @@ fn field(label: String, value: String) -> Element<'static, Message> {
         .into()
 }
 
-fn group_title(kind: GroupKind) -> String {
-    match kind {
-        GroupKind::Protected => fl!("protected-title"),
-        GroupKind::Removable => fl!("removable-title"),
-    }
+/// A small pill under the app name. The classification tag uses the accent
+/// tint so the eye can separate "mine" from "part of the system" at a glance.
+fn tag_badge<'a>(label: &'a str, accent: bool) -> Element<'a, Message> {
+    let class = if accent {
+        cosmic::theme::Container::custom(|theme| {
+            let cosmic = theme.cosmic();
+            let mut background: cosmic::iced::Color = cosmic.accent.base.into();
+            background.a = 0.22;
+            cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(background)),
+                border: cosmic::iced::Border {
+                    radius: cosmic.corner_radii.radius_xs.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        })
+    } else {
+        cosmic::theme::Container::Card
+    };
+    container(text::caption(label.to_owned()))
+        .padding([1, 6])
+        .class(class)
+        .into()
 }
 
-fn group_caption(kind: GroupKind) -> String {
-    match kind {
-        GroupKind::Protected => fl!("protected-caption"),
-        GroupKind::Removable => fl!("removable-caption"),
-    }
+fn kind_tag_badge<'a>(label: &'a str) -> Element<'a, Message> {
+    tag_badge(label, true)
+}
+
+fn source_tag_badge<'a>(label: &'a str) -> Element<'a, Message> {
+    tag_badge(label, false)
 }
 
 /// One app row with its three-dot menu. The row itself is not clickable:
@@ -1644,21 +1727,41 @@ fn group_caption(kind: GroupKind) -> String {
 ///
 /// The subtitle and the icon arrive precomputed and the row is identified by
 /// its index, so a redraw neither formats texts nor clones ids.
-fn app_row<'a>(
-    app: &'a InstalledApp,
+/// Everything a row needs beyond the app itself, resolved once per inventory
+/// load so a redraw does not format text or look anything up.
+struct RowView<'a> {
     subtitle: &'a str,
+    kind_tag: &'a str,
+    source_tag: &'a str,
     icon: widget::icon::Handle,
-    index: usize,
     selected: bool,
     menu_open: bool,
     update_available: bool,
+}
+
+fn app_row<'a>(
+    app: &'a InstalledApp,
+    view: RowView<'a>,
+    index: usize,
 ) -> Element<'a, Message> {
+    let RowView {
+        subtitle,
+        kind_tag,
+        source_tag,
+        icon,
+        selected,
+        menu_open,
+        update_available,
+    } = view;
     let icon = widget::icon::icon(icon).size(32);
 
     let title = text(app.name.as_str()).size(15);
     let subtitle = text(subtitle).size(12);
+    let tags = widget::row![kind_tag_badge(kind_tag), source_tag_badge(source_tag)]
+        .spacing(4)
+        .align_y(Alignment::Center);
 
-    let labels = widget::column![title, subtitle]
+    let labels = widget::column![title, subtitle, tags]
         .spacing(2)
         .width(Length::Fill);
 

@@ -5,7 +5,18 @@ app-title = App Manager
 
 nav-user = User Installed
 nav-system = System Installed
-nav-maintainer = Maintainer
+nav-maintainer = Install from GitHub
+nav-apps = Installed apps
+
+tag-all = All
+tag-user = User
+tag-preinstalled = Pre-installed
+tag-system = System
+tag-any-source = Any source
+tag-deb = Deb
+tag-flatpak = Flatpak
+tag-appimage = AppImage
+tag-github = GitHub
 
 search-placeholder = Search apps
 refresh = Refresh
