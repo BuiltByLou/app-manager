@@ -153,13 +153,17 @@ impl SystemProbe for RealProbe {
     }
 
     fn flatpak_apps(&self) -> Vec<FlatpakApp> {
-        run(Command::new("flatpak").args([
+        let mut apps = run(Command::new("flatpak").args([
             "list",
             "--app",
             "--columns=application,name,version,origin,installation,size",
         ]))
         .map(|out| parse_flatpak_list(&out))
-        .unwrap_or_default()
+        .unwrap_or_default();
+        for app in &mut apps {
+            app.icon = crate::flatpak_icon::find_icon(&app.id);
+        }
+        apps
     }
 
     fn appimages(&self) -> Vec<PathBuf> {

@@ -6,6 +6,8 @@ pub struct FlatpakApp {
     pub origin: String,
     pub user_installation: bool,
     pub size_bytes: u64,
+    /// Absolute path to an icon file, when one can be found.
+    pub icon: Option<String>,
 }
 
 /// Lê a saída de:
@@ -32,6 +34,7 @@ pub fn parse_flatpak_list(text: &str) -> Vec<FlatpakApp> {
                 origin: origin.to_owned(),
                 user_installation: installation.eq_ignore_ascii_case("user"),
                 size_bytes: parse_flatpak_size(size),
+                icon: None,
             })
         })
         .collect()

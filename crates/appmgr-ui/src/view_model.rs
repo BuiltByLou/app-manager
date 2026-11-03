@@ -46,8 +46,11 @@ pub fn matching(apps: &[App], kind: InstallKind, query: &str) -> Vec<usize> {
 /// first; protected ones are locked, so they sit at the bottom and can be
 /// hidden. `show_protected` keeps them out of the list entirely when false.
 pub fn system_groups(apps: &[App], query: &str, show_protected: bool) -> Vec<Group> {
-    let (protected, removable): (Vec<usize>, Vec<usize>) = matching(apps, InstallKind::System, query)
-        .into_iter()
+    let (protected, removable): (Vec<usize>, Vec<usize>) = apps
+        .iter()
+        .enumerate()
+        .filter(|(_, app)| app.kind != InstallKind::User && matches(app, query))
+        .map(|(index, _)| index)
         .partition(|&index| apps[index].protected);
 
     let mut groups = Vec::new();
@@ -68,9 +71,10 @@ pub fn system_groups(apps: &[App], query: &str, show_protected: bool) -> Vec<Gro
 
 /// How many locked system apps match the current search, shown or not.
 pub fn protected_count(apps: &[App], query: &str) -> usize {
-    matching(apps, InstallKind::System, query)
+    apps
         .iter()
-        .filter(|&&index| apps[index].protected)
+        .enumerate()
+        .filter(|(_, app)| app.kind != InstallKind::User && app.protected && matches(app, query))
         .count()
 }
 

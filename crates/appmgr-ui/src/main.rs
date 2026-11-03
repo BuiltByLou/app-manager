@@ -309,10 +309,14 @@ impl Application for AppManager {
                 // A managed AppImage uses a stable filename, so its version is
                 // not in the name anymore. The source registry still knows it.
                 for app in &mut apps {
-                    if let Some(managed) = self.registry.get(&app.id)
-                        && !managed.installed_version.is_empty()
-                    {
-                        app.version = Some(managed.installed_version.clone());
+                    if let Some(managed) = self.registry.get(&app.id) {
+                        if !managed.installed_version.is_empty() {
+                            app.version = Some(managed.installed_version.clone());
+                        }
+                        // An app installed from GitHub is always the user's app,
+                        // even when it came in as a .deb or a system Flatpak.
+                        app.kind = InstallKind::User;
+                        app.protected = false;
                     }
                 }
                 self.apps = apps;
@@ -1386,26 +1390,33 @@ impl AppManager {
         content = content.push(fields);
 
         let mut source_actions = widget::row![].spacing(8);
-        if let Some(managed) = managed {
-            source_actions = source_actions.push(
-                button::link(managed.repo.clone()).on_press(Message::OpenUrl(format!(
-                    "https://github.com/{}",
-                    managed.repo
-                ))),
-            );
-            source_actions =
-                source_actions.push(button::text(fl!("source-edit")).on_press(Message::LinkSource(index)));
-            if self.is_checking(&app.id) {
-                source_actions = source_actions.push(button::standard(fl!("update-checking")));
+        let mut has_source = false;
+        if managed.is_some() || app.origin == Origin::AppImage {
+            if let Some(managed) = managed {
+                source_actions = source_actions.push(
+                    button::link(managed.repo.clone()).on_press(Message::OpenUrl(format!(
+                        "https://github.com/{}",
+                        managed.repo
+                    ))),
+                );
+                source_actions =
+                    source_actions.push(button::text(fl!("source-edit")).on_press(Message::LinkSource(index)));
+                if self.is_checking(&app.id) {
+                    source_actions = source_actions.push(button::standard(fl!("update-checking")));
+                } else {
+                    source_actions = source_actions
+                        .push(button::text(fl!("update-check")).on_press(Message::CheckApp(index)));
+                }
+                has_source = true;
             } else {
                 source_actions = source_actions
-                    .push(button::text(fl!("update-check")).on_press(Message::CheckApp(index)));
+                    .push(button::standard(fl!("source-link")).on_press(Message::LinkSource(index)));
+                has_source = true;
             }
-        } else {
-            source_actions = source_actions
-                .push(button::standard(fl!("source-link")).on_press(Message::LinkSource(index)));
         }
-        content = content.push(source_actions);
+        if has_source {
+            content = content.push(source_actions);
+        }
 
         if let Some(check) = self.updates.get(&app.id) {
             if check.asset.is_some()
@@ -1740,8 +1751,13 @@ fn subtitle(app: &InstalledApp) -> String {
 
 /// Resolves an app's icon once, instead of on every redraw.
 fn app_icon(app: &InstalledApp) -> widget::icon::Handle {
-    let name = app.icon.as_deref().unwrap_or("application-x-executable");
-    widget::icon::from_name(name).handle()
+    match app.icon.as_deref() {
+        Some(value) if value.contains('/') && std::path::Path::new(value).is_file() => {
+            widget::icon::from_path(std::path::PathBuf::from(value))
+        }
+        Some(value) if !value.is_empty() => widget::icon::from_name(value).handle(),
+        _ => widget::icon::from_name("application-x-executable").handle(),
+    }
 }
 
 fn origin_label(origin: Origin) -> String {

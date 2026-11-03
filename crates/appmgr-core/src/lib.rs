@@ -1,6 +1,8 @@
 pub mod desktop;
 pub mod dpkg;
+pub mod appimage_icon;
 pub mod flatpak;
+pub mod flatpak_icon;
 pub mod github;
 pub mod install;
 pub mod inventory;

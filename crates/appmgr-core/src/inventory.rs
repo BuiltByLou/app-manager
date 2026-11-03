@@ -16,7 +16,9 @@ pub enum Origin {
 pub enum InstallKind {
     /// Instalada pelo utilizador; remover é seguro por princípio.
     User,
-    /// Parte do sistema; remover pode partir a máquina.
+    /// Parte do sistema, mas removível sem partir a máquina.
+    PreInstalled,
+    /// Essencial ou parte do desktop: remover pode partir o sistema.
     System,
 }
 
@@ -77,12 +79,12 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             id,
             name: flatpak.name,
             version: Some(flatpak.version),
-            icon: None,
+            icon: flatpak.icon.clone(),
             origin: Origin::Flatpak,
             kind: if flatpak.user_installation {
                 InstallKind::User
             } else {
-                InstallKind::System
+                InstallKind::PreInstalled
             },
             protected: false,
             size_bytes: flatpak.size_bytes,
@@ -99,11 +101,12 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| id.clone());
+        let icon = crate::appimage_icon::find_icon(&path);
         apps.push(App {
             id,
             name,
             version: crate::version::version_from_filename(&path),
-            icon: None,
+            icon,
             origin: Origin::AppImage,
             kind: InstallKind::User,
             protected: false,
@@ -152,8 +155,10 @@ pub fn build_inventory(probe: &impl SystemProbe) -> Vec<App> {
             version: Some(package.version.clone()),
             icon: entry.icon,
             origin: Origin::Apt,
-            kind: if is_system_package(package, &manual, &desktop) {
+            kind: if is_protected(package, &desktop) {
                 InstallKind::System
+            } else if is_system_package(package, &manual, &desktop) {
+                InstallKind::PreInstalled
             } else {
                 InstallKind::User
             },
@@ -322,6 +327,7 @@ mod tests {
                 origin: "flathub".to_owned(),
                 user_installation: true,
                 size_bytes: 58_200_000,
+                icon: None,
             }],
             appimages: vec![PathBuf::from("/home/ed/Applications/tool.AppImage")],
             programs: HashMap::new(),
@@ -361,7 +367,7 @@ mod tests {
     fn marks_auto_installed_packages_as_system() {
         let apps = build_inventory(&fake());
         let software = apps.iter().find(|a| a.name == "Software").unwrap();
-        assert_eq!(software.kind, InstallKind::System);
+        assert_eq!(software.kind, InstallKind::PreInstalled);
         assert!(!software.protected, "auto-instalada mas removível");
     }
 
