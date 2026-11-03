@@ -1323,7 +1323,7 @@ impl AppManager {
             card = card.push(text::title3(name));
             card = card.push(text::caption(release.tag.clone()));
 
-            let mut buttons = widget::row![].spacing(8);
+            let mut buttons = widget::row![].spacing(8).wrap();
             for asset in &self.maint_assets {
                 let label = match asset.kind {
                     AssetKind::Deb => "Install .deb",
@@ -1338,7 +1338,7 @@ impl AppManager {
             card = card.push(buttons);
             content = content.push(
                 container(card.padding(16))
-                    .width(Length::Fixed(220.0)),
+                    .width(Length::Shrink),
             );
         }
 
